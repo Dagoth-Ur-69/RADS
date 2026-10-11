@@ -10,7 +10,7 @@ Welcome to the RADS programming language documentation directory. This comprehen
 |--------------|-------------|------------|
 | [README.md](../README.md) | Main project README with installation and quick start | Everyone |
 | [CHANGELOG.md](../CHANGELOG.md) | Complete version history and release notes | Everyone |
-| [V0.0.6_QUICK_REFERENCE.md](V0.0.6_QUICK_REFERENCE.md) | Quick reference for the current release | Users & Developers |
+| [V0.0.6_QUICK_REFERENCE.md](archive/V0.0.6_QUICK_REFERENCE.md) | Quick reference for the current release | Users & Developers |
 
 ---
 
@@ -130,12 +130,11 @@ Welcome to the RADS programming language documentation directory. This comprehen
 ## 🔧 Development & Architecture
 
 ### Version Documentation
-- **[V0.0.6_QUICK_REFERENCE.md](V0.0.6_QUICK_REFERENCE.md)** - Current release quick reference
+- **[V0.0.6_QUICK_REFERENCE.md](archive/V0.0.6_QUICK_REFERENCE.md)** - Current release quick reference
 - **[CHANGELOG.md](../CHANGELOG.md)** - Full version history
 
 ### Web Engine
 - **[WEB_ENGINE_DESIGN.md](WEB_ENGINE_DESIGN.md)** - Web framework architecture
-- **[WEB_ENGINE_COMPLETE.md](WEB_ENGINE_COMPLETE.md)** - Implementation report
 - **[WEB_ENGINE_API.md](WEB_ENGINE_API.md)** - Web engine API reference
 
 ### Constellation (Distributed Computing)
