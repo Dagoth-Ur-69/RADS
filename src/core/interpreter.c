@@ -251,12 +251,25 @@ typedef struct Environment {
 
 static Environment* global_env = NULL;
 
-static void env_set(const char* name, Value value) {
+// Call-frame scopes: parameters and function locals live in a frame so that
+// recursive/nested calls cannot clobber each other's variables (frame locals
+// shadow globals; globals remain visible). Previously parameters were bound
+// straight into the global environment, which broke recursion like
+// fib(n-1) + fib(n-2): the first call overwrote the global `n` before the
+// second argument was evaluated.
+typedef struct EnvFrame {
+    Environment* locals;
+    struct EnvFrame* next; // caller's frame
+} EnvFrame;
+
+static EnvFrame* env_frame = NULL; // NULL = executing at global scope
+
+static void env_list_set(Environment** list, const char* name, Value value) {
     // Always clone the value to ensure proper ownership
     Value cloned_value = value_clone(value);
 
     // Check existing
-    Environment* current = global_env;
+    Environment* current = *list;
     while (current) {
         if (strcmp(current->name, name) == 0) {
             value_free(&current->value); // Free old value
@@ -270,30 +283,96 @@ static void env_set(const char* name, Value value) {
     Environment* env = malloc(sizeof(Environment));
     env->name = strdup(name);
     env->value = cloned_value;
-    env->next = global_env;
-    global_env = env;
+    env->next = *list;
+    *list = env;
 }
 
-static Value env_get(const char* name) {
-    Environment* current = global_env;
+// Find a name in a list; returns false if absent (a stored null value is a
+// real value and must be distinguishable from "not found").
+static bool env_list_get(Environment* list, const char* name, Value* out) {
+    Environment* current = list;
     while (current) {
         if (strcmp(current->name, name) == 0) {
             // Return a clone to ensure proper ownership
-            return value_clone(current->value);
+            *out = value_clone(current->value);
+            return true;
         }
         current = current->next;
     }
+    return false;
+}
+
+static void env_list_free(Environment** list) {
+    Environment* current = *list;
+    while (current) {
+        Environment* next = current->next;
+        free(current->name);
+        value_free(&current->value);
+        free(current);
+        current = next;
+    }
+    *list = NULL;
+}
+
+static void env_set(const char* name, Value value) {
+    // Assignment semantics: update an existing binding in any visible scope
+    // (frames first, then globals); if none exists, create one in the
+    // innermost scope (the current frame, or globals at top level).
+    for (EnvFrame* f = env_frame; f; f = f->next) {
+        for (Environment* current = f->locals; current; current = current->next) {
+            if (strcmp(current->name, name) == 0) {
+                value_free(&current->value);
+                current->value = value_clone(value);
+                return;
+            }
+        }
+    }
+    for (Environment* current = global_env; current; current = current->next) {
+        if (strcmp(current->name, name) == 0) {
+            value_free(&current->value);
+            current->value = value_clone(value);
+            return;
+        }
+    }
+    if (env_frame) {
+        env_list_set(&env_frame->locals, name, value);
+    } else {
+        env_list_set(&global_env, name, value);
+    }
+}
+
+// Declaration semantics (parameters, 'turbo' locals): always create the
+// binding in the innermost scope, shadowing same-named bindings in enclosing
+// frames/globals. Without this, a callee's parameter or local would overwrite
+// the caller's variable of the same name (env_set updates the nearest
+// existing binding, which for a recursive call is the caller's frame).
+static void env_decl(const char* name, Value value) {
+    if (env_frame) {
+        env_list_set(&env_frame->locals, name, value);
+    } else {
+        env_list_set(&global_env, name, value);
+    }
+}
+
+static Value env_get(const char* name) {
+    Value v;
+    // Innermost frame out: locals shadow same-named globals.
+    for (EnvFrame* f = env_frame; f; f = f->next) {
+        if (env_list_get(f->locals, name, &v)) return v;
+    }
+    if (env_list_get(global_env, name, &v)) return v;
     return make_null();
 }
 
 // Get a reference to a value in the environment (for in-place modification)
 static Value* env_get_ref(const char* name) {
-    Environment* current = global_env;
-    while (current) {
-        if (strcmp(current->name, name) == 0) {
-            return &current->value;
+    for (EnvFrame* f = env_frame; f; f = f->next) {
+        for (Environment* current = f->locals; current; current = current->next) {
+            if (strcmp(current->name, name) == 0) return &current->value;
         }
-        current = current->next;
+    }
+    for (Environment* current = global_env; current; current = current->next) {
+        if (strcmp(current->name, name) == 0) return &current->value;
     }
     return NULL;
 }
@@ -1371,7 +1450,7 @@ static ExecResult exec_statement(ASTNode* node) {
                     }
                 }
             } else if (node->variable_decl.name) {
-                env_set(node->variable_decl.name, val);
+                env_decl(node->variable_decl.name, val);
             }
             value_free(&val);
             return EXEC_OK;
@@ -1405,14 +1484,19 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
     }
 
     ASTNode* func = callback.func_node;
-    // Bind parameters naively to globals for now
+    // Push a call frame: parameters and locals live in the frame, not in the
+    // global environment (which previously let nested/recursive calls
+    // clobber each other's parameters). Frame pops on every exit path here.
+    EnvFrame frame = {0};
+    frame.next = env_frame;
+    env_frame = &frame;
     if (func->function_decl.parameters) {
         int param_count = (int)func->function_decl.parameters->count;
         for (int i = 0; i < param_count; i++) {
             ASTNode* param_node = func->function_decl.parameters->nodes[i];
             const char* pname;
             Value arg;
-            
+
             if (param_node->type == AST_VARIABLE_DECL) {
                 pname = param_node->variable_decl.name;
                 if (i < argc && args) {
@@ -1426,18 +1510,20 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
                 pname = param_node->identifier.name;
                 arg = (i < argc && args) ? value_clone(args[i]) : make_null();
             }
-            env_set(pname, arg);
+            env_decl(pname, arg);
             value_free(&arg);
         }
     }
     ExecResult r = exec_statement(func->function_decl.body);
+    env_frame = frame.next; // pop frame (locals freed below)
+    Value rv;
     if (r == EXEC_RETURN && has_return_value) {
-        Value rv = value_clone(current_return_value);
-        value_free(&current_return_value);
-        has_return_value = false;
-        return rv;
+        rv = value_clone(current_return_value);
+    } else {
+        rv = make_null();
     }
-    return make_null();
+    env_list_free(&frame.locals);
+    return rv;
 }
 
 // Main interpreter

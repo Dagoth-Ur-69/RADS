@@ -1282,17 +1282,32 @@ void parser_init(Parser* parser, Lexer* lexer) {
     advance(parser);
 }
 
+// True when the parser's current token is unchanged since `before` — used
+// to detect a parse iteration that consumed no input (a guaranteed infinite
+// loop otherwise: panic mode suppresses errors and nothing advances).
+static bool parser_stalled(Parser* parser, Token before) {
+    return parser->current.type == before.type
+        && parser->current.start == before.start
+        && parser->current.length == before.length;
+}
+
 // Main parse function
 ASTNode* parser_parse(Parser* parser) {
     ASTList* declarations = ast_list_create();
 
     while (!match(parser, TOKEN_EOF)) {
+        Token before = parser->current;
         ASTNode* decl = parse_declaration(parser);
         if (decl) {
             ast_list_append(declarations, decl);
         } else if (parser->panic_mode) {
             // Parser is in panic mode - synchronize to recover
             synchronize(parser);
+        }
+        // Forward-progress guard: never let a top-level iteration spin
+        // without consuming a token (unbounded stderr = disk-fill risk).
+        if (parser->current.type != TOKEN_EOF && parser_stalled(parser, before)) {
+            advance(parser);
         }
     }
 
