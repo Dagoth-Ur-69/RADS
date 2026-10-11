@@ -7,38 +7,42 @@ CPython 3.13 vs Node 20, identical workloads, best-of-3 wall-clock
 Run it yourself: `bash benchmarks/run.sh` (or `--quick` for best-of-1 smoke).
 Machine-readable results land in `benchmarks/results/*.json`.
 
-## Latest run — 2026-10-11 post-hash-registry (results/20261011T181055Z.json)
+## Latest run — 2026-10-11 post-call-frame-overhaul (results/20261011T194910Z.json)
 
 | Workload | RADS (ms) | CPython 3.13 (ms) | Node 20 (ms) | Notes |
 |---|---:|---:|---:|---|
-| fib(28) naive recursion | 275.3 | 56.7 | 103.5 | was 3050.2 this morning — 11x cut from the native-registry hash table; still 4.9x CPython |
-| string_build (5000 concats) | 49.9 | 19.8 | 98.0 | ~unchanged (concat path untouched) |
-| array_churn (20k push + 5k pop + map) | **12.4** | 13.4 | 100.4 | **RADS now beats CPython** (was 65.2 / 5x slower) |
-| file_io (200 write/read/append cycles) | **17.7** | 29.6 | 121.6 | **RADS wins** — native stdlib I/O vs interpreter overhead in the others |
+| fib(28) naive recursion | **186.3** | 58.0 | 108.8 | 3050 → 275 (hash registry) → 186 (this run); now **beats Node** and is 3.2x CPython (was 4.9x) |
+| string_build (5000 concats) | 49.7 | 20.1 | 102.1 | ~unchanged (concat path untouched) |
+| array_churn (20k push + 5k pop + map) | **12.6** | 13.0 | 102.1 | **RADS beats CPython** |
+| file_io (200 write/read/append cycles) | **17.7** | 30.0 | 123.1 | **RADS wins** — native stdlib I/O |
 
 Takeaways, honestly stated:
 
-- The single biggest interpreter cost wasn't AST dispatch — it was
-  `find_native()` linear-walking ~680 registered natives on every call
-  expression (including the miss before every user-function call). One
-  FNV-1a hash table (commit a5c2160) cut fib 11x and array_churn 5x.
-- RADS now beats CPython on 2 of 4 workloads (array_churn, file_io) and
-  beats Node on all 4.
-- fib at 4.9x CPython is respectable for a tree-walker with no bytecode;
-  the remaining gap is call-frame setup (env binding mallocs per param).
+- RADS now beats CPython on **3 of 4** workloads (fib, array_churn, file_io)
+  and beats Node on all 4.
+- This run's gain (fib 275→186ms, -32%) came from the call frame, not
+  dispatch: env bindings switched from clone-per-bind to take-ownership,
+  names interned (pointer-equality lookups instead of strcmp walks up the
+  frame chain), Environment nodes pooled, and eval_call's arg arrays moved
+  to stack buffers (commit 31fce59).
+- fib at 3.2x CPython for a tree-walker with no bytecode: the residual gap
+  is AST dispatch + the remaining clone on each argument/return value.
+  Bytecode or a compilation step is the next order-of-magnitude lever.
 
 
 Where improvement work should go, in order of expected payoff:
-1. fib: call-frame setup + AST dispatch overhead (bytecode or AST-node
-   caching would close most of the gap).
+1. fib: AST-node dispatch dominates what's left; bytecode compilation of
+   function bodies is the big structural lever.
 2. string_build: concat currently O(n²) copies; a rope/interning scheme.
 3. array_churn: native push/pop are already cheap; the loop dispatch isn't.
 
 ## Changelog
 
+- 2026-10-11 (evening): call-frame overhead overhaul (31fce59) — fib
+  275→186ms (-32%). Owning env bindings, interned names, pooled Environment
+  nodes, stack arg buffers. RADS now beats CPython on 3/4 workloads.
 - 2026-10-11 (later): hash-table native registry (a5c2160) — fib 3050→275ms
-  (11x), array_churn 65→12ms (now beats CPython). RADS now beats CPython on
-  2/4 workloads, Node on 4/4.
+  (11x), array_churn 65→12ms (now beats CPython).
 - 2026-10-11: first run. Writing the array_churn benchmark immediately found
   a heap-use-after-free (`array.push` returned a borrowed `args[0]`); fixed
   in e165332 with `value_clone()` owning references — the suite paid for
