@@ -308,6 +308,7 @@ static ASTNode* parse_primary(Parser* parser) {
 // Parse call expressions
 static ASTNode* parse_call(Parser* parser) {
     ASTNode* expr = parse_primary(parser);
+    if (!expr) return NULL; /* propagate parse error instead of dereferencing NULL */
     
     while (true) {
         if (match(parser, TOKEN_LEFT_BRACE)) { // Struct literal
@@ -680,6 +681,25 @@ static ASTNode* parse_block(Parser* parser) {
     while (!check(parser, TOKEN_RIGHT_BRACE) && !check(parser, TOKEN_EOF)) {
         ASTNode* stmt = parse_statement(parser);
         if (stmt) ast_list_append(statements, stmt);
+        else if (parser->panic_mode) {
+            /* Error recovery: skip to a statement boundary (like synchronize,
+             * but stop at the '}' that ends this block). Without this, a NULL
+             * statement that consumed no token loops forever. */
+            parser->panic_mode = false;
+            while (!check(parser, TOKEN_RIGHT_BRACE) && !check(parser, TOKEN_EOF)) {
+                if (parser->previous.type == TOKEN_SEMICOLON) break;
+                switch (parser->current.type) {
+                    case TOKEN_STRUCT: case TOKEN_ENUM: case TOKEN_BLAST:
+                    case TOKEN_ASYNC: case TOKEN_TURBO: case TOKEN_IF:
+                    case TOKEN_LOOP: case TOKEN_CRUISE: case TOKEN_RETURN:
+                    case TOKEN_ECHO: case TOKEN_IMPORT:
+                        goto done_recover;
+                    default:
+                        advance(parser);
+                }
+            }
+            done_recover:;
+        }
     }
     
     consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after block");

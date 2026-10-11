@@ -61,6 +61,14 @@ Value make_null() {
     return v;
 }
 
+/* Error convention for stdlib natives: print to stderr and return null. */
+Value make_error(const char* msg) {
+    fprintf(stderr, "Error: %s\n", msg);
+    Value v;
+    v.type = VAL_NULL;
+    return v;
+}
+
 Value make_bool(bool val) { Value v = { .type = VAL_BOOL, .bool_val = val }; return v; }
 Value make_int(long long val) { Value v = { .type = VAL_INT, .int_val = val }; return v; }
 Value make_float(double val) { Value v = { .type = VAL_FLOAT, .float_val = val }; return v; }

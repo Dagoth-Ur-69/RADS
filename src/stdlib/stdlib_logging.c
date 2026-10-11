@@ -112,88 +112,98 @@ static void emit_log(int level, const char* msg) {
 
 /* ── Native function wrappers ── */
 
-static Value native_log_debug(int argc, Value* argv) {
+static Value native_log_debug(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 1) return make_error("logging.debug(msg) requires 1 argument");
-    emit_log(LOG_DEBUG, argv[0].type == VAL_STRING ? argv[0].as.string : "");
+    emit_log(LOG_DEBUG, argv[0].type == VAL_STRING ? argv[0].string_val : "");
     return make_null();
 }
 
-static Value native_log_info(int argc, Value* argv) {
+static Value native_log_info(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 1) return make_error("logging.info(msg) requires 1 argument");
-    emit_log(LOG_INFO, argv[0].type == VAL_STRING ? argv[0].as.string : "");
+    emit_log(LOG_INFO, argv[0].type == VAL_STRING ? argv[0].string_val : "");
     return make_null();
 }
 
-static Value native_log_warning(int argc, Value* argv) {
+static Value native_log_warning(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 1) return make_error("logging.warning(msg) requires 1 argument");
-    emit_log(LOG_WARNING, argv[0].type == VAL_STRING ? argv[0].as.string : "");
+    emit_log(LOG_WARNING, argv[0].type == VAL_STRING ? argv[0].string_val : "");
     return make_null();
 }
 
-static Value native_log_error(int argc, Value* argv) {
+static Value native_log_error(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 1) return make_error("logging.error(msg) requires 1 argument");
-    emit_log(LOG_ERROR, argv[0].type == VAL_STRING ? argv[0].as.string : "");
+    emit_log(LOG_ERROR, argv[0].type == VAL_STRING ? argv[0].string_val : "");
     return make_null();
 }
 
-static Value native_log_critical(int argc, Value* argv) {
+static Value native_log_critical(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 1) return make_error("logging.critical(msg) requires 1 argument");
-    emit_log(LOG_CRITICAL, argv[0].type == VAL_STRING ? argv[0].as.string : "");
+    emit_log(LOG_CRITICAL, argv[0].type == VAL_STRING ? argv[0].string_val : "");
     return make_null();
 }
 
-static Value native_log_log(int argc, Value* argv) {
+static Value native_log_log(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 2) return make_error("logging.log(level, msg) requires 2 arguments");
-    int level = (argv[0].type == VAL_INT) ? (int)argv[0].as.integer : LOG_INFO;
-    const char* msg = argv[1].type == VAL_STRING ? argv[1].as.string : "";
+    int level = (argv[0].type == VAL_INT) ? (int)argv[0].int_val : LOG_INFO;
+    const char* msg = argv[1].type == VAL_STRING ? argv[1].string_val : "";
     emit_log(level, msg);
     return make_null();
 }
 
-static Value native_set_level(int argc, Value* argv) {
+static Value native_set_level(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 1) return make_error("logging.setLevel(level) requires 1 argument");
-    g_log_level = (argv[0].type == VAL_INT) ? (int)argv[0].as.integer : LOG_INFO;
+    g_log_level = (argv[0].type == VAL_INT) ? (int)argv[0].int_val : LOG_INFO;
     return make_null();
 }
 
-static Value native_get_level(int argc, Value* argv) {
+static Value native_get_level(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     (void)argc; (void)argv;
     return make_int(g_log_level);
 }
 
-static Value native_get_level_name(int argc, Value* argv) {
+static Value native_get_level_name(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     if (argc < 1) return make_error("logging.getLevelName(level) requires 1 argument");
-    int level = (argv[0].type == VAL_INT) ? (int)argv[0].as.integer : 0;
+    int level = (argv[0].type == VAL_INT) ? (int)argv[0].int_val : 0;
     return make_string(level_name(level));
 }
 
-static Value native_basic_config(int argc, Value* argv) {
+static Value native_basic_config(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
     /* logging.basicConfig() accepts optional named options via struct/map */
     if (argc >= 1 && argv[0].type == VAL_STRING) {
         /* Simple string arg treated as filename */
         if (g_log_file) fclose(g_log_file);
-        g_log_file = fopen(argv[0].as.string, "a");
+        g_log_file = fopen(argv[0].string_val, "a");
         if (!g_log_file) return make_error("logging.basicConfig: could not open file");
     }
     if (argc >= 2 && argv[1].type == VAL_INT) {
-        g_log_level = (int)argv[1].as.integer;
+        g_log_level = (int)argv[1].int_val;
     }
     if (argc >= 3 && argv[2].type == VAL_STRING) {
-        strncpy(g_log_format, argv[2].as.string, sizeof(g_log_format) - 1);
+        strncpy(g_log_format, argv[2].string_val, sizeof(g_log_format) - 1);
     }
     if (argc >= 4 && argv[3].type == VAL_INT) {
-        g_include_timestamp = (argv[3].as.integer != 0);
+        g_include_timestamp = (argv[3].int_val != 0);
     }
     return make_null();
 }
 
 /* ── Constants as functions ── */
-static Value native_logging_debug_val(int argc, Value* argv) { (void)argc; (void)argv; return make_int(LOG_DEBUG); }
-static Value native_logging_info_val(int argc, Value* argv) { (void)argc; (void)argv; return make_int(LOG_INFO); }
-static Value native_logging_warning_val(int argc, Value* argv) { (void)argc; (void)argv; return make_int(LOG_WARNING); }
-static Value native_logging_error_val(int argc, Value* argv) { (void)argc; (void)argv; return make_int(LOG_ERROR); }
-static Value native_logging_critical_val(int argc, Value* argv) { (void)argc; (void)argv; return make_int(LOG_CRITICAL); }
-static Value native_logging_notset_val(int argc, Value* argv) { (void)argc; (void)argv; return make_int(LOG_NOTSET); }
+static Value native_logging_debug_val(struct Interpreter* interp, int argc, Value* argv) { (void)interp; (void)argc; (void)argv; return make_int(LOG_DEBUG); }
+static Value native_logging_info_val(struct Interpreter* interp, int argc, Value* argv) { (void)interp; (void)argc; (void)argv; return make_int(LOG_INFO); }
+static Value native_logging_warning_val(struct Interpreter* interp, int argc, Value* argv) { (void)interp; (void)argc; (void)argv; return make_int(LOG_WARNING); }
+static Value native_logging_error_val(struct Interpreter* interp, int argc, Value* argv) { (void)interp; (void)argc; (void)argv; return make_int(LOG_ERROR); }
+static Value native_logging_critical_val(struct Interpreter* interp, int argc, Value* argv) { (void)interp; (void)argc; (void)argv; return make_int(LOG_CRITICAL); }
+static Value native_logging_notset_val(struct Interpreter* interp, int argc, Value* argv) { (void)interp; (void)argc; (void)argv; return make_int(LOG_NOTSET); }
 
 /* ── Registration ── */
 void stdlib_logging_register(void) {

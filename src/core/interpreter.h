@@ -98,6 +98,7 @@ Value make_float(double val);
 Value make_string(const char* val);
 Value make_bool(bool val);
 Value make_null(void);
+Value make_error(const char* msg);
 Array* array_create(size_t capacity);
 void array_push(Array* arr, Value v);
 

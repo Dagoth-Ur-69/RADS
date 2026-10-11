@@ -425,7 +425,7 @@ Value native_str_split(struct Interpreter* interp, int argc, Value* args) {
         p++;
     }
     
-    Value v; v.type = VAL_ARRAY; v.array_val = create_array(count);
+    Value v; v.type = VAL_ARRAY; v.array_val = array_create(count);
     p = str;
     char buffer[1024]; int buf_idx = 0;
     

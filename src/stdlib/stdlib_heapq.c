@@ -1,64 +1,66 @@
+/*
+ * stdlib_heapq.c — RADS heapq module
+ *
+ * Python-inspired heap queue (priority queue) for RADS.
+ * Min-heap by default, like Python's heapq.
+ *
+ * Functions:
+ * - heapq_heapify(arr)       — transform array into a heap in-place
+ * - heapq_heappush(arr, val) — push value onto heap, keep invariant
+ * - heapq_heappop(arr)       — pop smallest value from heap
+ * - heapq_heappushpop(arr,v) — push then pop (efficient combined op)
+ * - heapq_heapreplace(arr,v) — pop then push (efficient combined op)
+ * - heapq_nlargest(n, arr)   — n largest elements (new array, descending)
+ * - heapq_nsmallest(n, arr)  — n smallest elements (new array, ascending)
+ * - heapq_merge(a, b)        — merge two sorted arrays into a new array
+ * - heapq_is_heap(arr)       — 1 if array satisfies heap invariant else 0
+ */
+
 #include "stdlib_heapq.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ── HeapQ Module ──
- * Python-inspired heap queue (priority queue) for RADS.
- * Uses min-heap by default (like Python's heapq).
- * Lightweight O(n log n) operations, suitable for all devices.
- *
- * Functions:
- * - heapq.heapify(arr)       - Transform array into a heap in-place
- * - heapq.heappush(arr, val) - Push value onto heap
- * - heapq.heappop(arr)       - Pop smallest value from heap
- * - heapq.heappushpop(arr, val) - Push then pop (more efficient than separate ops)
- * - heapq.heapreplace(arr, val) - Pop then push (more efficient than separate ops)
- * - heapq.nlargest(n, arr)   - Get n largest elements
- * - heapq.nsmallest(n, arr)  - Get n smallest elements
- * - heapq.merge(a, b)        - Merge two sorted arrays
- * - heapq.is_heap(arr)       - Check if array satisfies heap invariant
- */
-
 extern Value make_int(long long val);
-extern Value make_float(double val);
-extern Value make_string(const char* val);
 extern Value make_null(void);
-extern Value make_error(const char* msg);
+extern Array* array_create(size_t capacity);
+extern void array_push(Array* arr, Value v);
+extern void register_native(const char* name, NativeFn fn);
 
 /* ── Helpers ── */
 
-static int arr_length(Value arr) {
-    return (arr.type == VAL_ARRAY) ? arr.as.array.length : 0;
+static double val_to_double(const Value* v) {
+    if (v->type == VAL_FLOAT) return v->float_val;
+    if (v->type == VAL_INT) return (double)v->int_val;
+    return 0.0;
 }
 
-static double arr_get_double(Value arr, int i) {
-    Value v = arr.as.array.values[i];
-    return (v.type == VAL_FLOAT) ? v.as.floating : (v.type == VAL_INT) ? (double)v.as.integer : 0;
-}
-
-/* For heap, we need to compare and swap elements in the array */
-static int cmp_values(Value a, Value b) {
-    double da = (a.type == VAL_FLOAT) ? a.as.floating : (a.type == VAL_INT) ? (double)a.as.integer : 0;
-    double db = (b.type == VAL_FLOAT) ? b.as.floating : (b.type == VAL_INT) ? (double)b.as.integer : 0;
+/* Compare two Values: -1, 0, or 1 (numeric; strings compare via strcmp) */
+static int cmp_values(const Value* a, const Value* b) {
+    if (a->type == VAL_STRING && b->type == VAL_STRING) {
+        int c = strcmp(a->string_val, b->string_val);
+        return (c > 0) - (c < 0);
+    }
+    double da = val_to_double(a);
+    double db = val_to_double(b);
     return (da > db) - (da < db);
 }
 
-static void swap_values(Value* arr, int i, int j) {
+static void swap_values(Value* arr, size_t i, size_t j) {
     Value tmp = arr[i];
     arr[i] = arr[j];
     arr[j] = tmp;
 }
 
-/* ── Sift down (heapify helper) ── */
-static void sift_down(Value* arr, int start, int end) {
-    int root = start;
+/* ── Sift down (heapify helper): children of i are 2i+1, 2i+2 ── */
+static void sift_down(Value* arr, size_t start, size_t end) {
+    size_t root = start;
     while (2 * root + 1 <= end) {
-        int child = 2 * root + 1;
-        int swap = root;
+        size_t child = 2 * root + 1;
+        size_t swap = root;
 
-        if (cmp_values(arr[swap], arr[child]) > 0) swap = child;
-        if (child + 1 <= end && cmp_values(arr[swap], arr[child + 1]) > 0) swap = child + 1;
+        if (cmp_values(&arr[swap], &arr[child]) > 0) swap = child;
+        if (child + 1 <= end && cmp_values(&arr[swap], &arr[child + 1]) > 0) swap = child + 1;
 
         if (swap == root) return;
         swap_values(arr, root, swap);
@@ -67,11 +69,11 @@ static void sift_down(Value* arr, int start, int end) {
 }
 
 /* ── Sift up (for push) ── */
-static void sift_up(Value* arr, int start) {
-    int child = start;
+static void sift_up(Value* arr, size_t start) {
+    size_t child = start;
     while (child > 0) {
-        int parent = (child - 1) / 2;
-        if (cmp_values(arr[child], arr[parent]) < 0) {
+        size_t parent = (child - 1) / 2;
+        if (cmp_values(&arr[child], &arr[parent]) < 0) {
             swap_values(arr, child, parent);
             child = parent;
         } else {
@@ -80,199 +82,192 @@ static void sift_up(Value* arr, int start) {
     }
 }
 
+static Value make_array_value(Array* a) {
+    Value r;
+    r.type = VAL_ARRAY;
+    r.array_val = a;
+    return r;
+}
+
 /* ── Functions ── */
 
-static Value native_heapify(int argc, Value* argv) {
-    if (argc < 1 || argv[0].type != VAL_ARRAY)
-        return make_error("heapq.heapify(arr) requires an array");
+static Value native_heapify(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    if (argc < 1 || argv[0].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_heapify(arr) requires an array\n");
+        return make_null();
+    }
 
-    int n = arr_length(argv[0]);
-    Value* arr = argv[0].as.array.values;
+    Array* a = argv[0].array_val;
+    if (a->count < 2) return make_null();
 
     /* Floyd's heap construction: O(n) */
-    for (int i = (n - 2) / 2; i >= 0; i--) {
-        sift_down(arr, i, n - 1);
+    for (size_t i = (a->count - 2) / 2 + 1; i-- > 0;) {
+        sift_down(a->items, i, a->count - 1);
     }
 
     return make_null(); /* in-place */
 }
 
-static Value native_heappush(int argc, Value* argv) {
-    if (argc < 2 || argv[0].type != VAL_ARRAY)
-        return make_error("heapq.heappush(arr, val) requires array and value");
+static Value native_heappush(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    if (argc < 2 || argv[0].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_heappush(arr, val) requires an array and a value\n");
+        return make_null();
+    }
 
-    Value* arr_val = &argv[0];
-    int n = arr_val->as.array.length;
+    Array* a = argv[0].array_val;
+    size_t n = a->count;
+    array_push(a, argv[1]); /* handles capacity growth */
+    sift_up(a->items, n);
 
-    /* Resize array */
-    Value* new_vals = realloc(arr_val->as.array.values, sizeof(Value) * (n + 1));
-    if (!new_vals) return make_error("heapq.heappush: out of memory");
-
-    arr_val->as.array.values = new_vals;
-    arr_val->as.array.values[n] = argv[1];
-    arr_val->as.array.length = n + 1;
-
-    sift_up(arr_val->as.array.values, n);
     return make_null();
 }
 
-static Value native_heappop(int argc, Value* argv) {
-    if (argc < 1 || argv[0].type != VAL_ARRAY)
-        return make_error("heapq.heappop(arr) requires an array");
+static Value native_heappop(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    if (argc < 1 || argv[0].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_heappop(arr) requires an array\n");
+        return make_null();
+    }
 
-    Value* arr_val = &argv[0];
-    int n = arr_val->as.array.length;
-    if (n == 0) return make_error("heapq.heappop: heap is empty");
+    Array* a = argv[0].array_val;
+    if (a->count == 0) {
+        fprintf(stderr, "Error: heapq_heappop: heap is empty\n");
+        return make_null();
+    }
 
-    Value result = arr_val->as.array.values[0];
-    arr_val->as.array.values[0] = arr_val->as.array.values[n - 1];
-    arr_val->as.array.length = n - 1;
-
-    if (n > 1) sift_down(arr_val->as.array.values, 0, n - 2);
+    Value result = a->items[0];
+    a->items[0] = a->items[a->count - 1];
+    a->count--;
+    if (a->count > 1) sift_down(a->items, 0, a->count - 1);
 
     return result;
 }
 
-static Value native_heappushpop(int argc, Value* argv) {
-    if (argc < 2 || argv[0].type != VAL_ARRAY)
-        return make_error("heapq.heappushpop(arr, val) requires array and value");
+static Value native_heappushpop(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    if (argc < 2 || argv[0].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_heappushpop(arr, val) requires an array and a value\n");
+        return make_null();
+    }
 
-    /* Push */
-    native_heappush(argc, argv);
-    /* Pop */
-    return native_heappop(1, argv);
+    Array* a = argv[0].array_val;
+    if (a->count == 0) return argv[1]; /* nothing to pop; new value wins */
+
+    /* If the new value is already the smallest, return it without touching the heap */
+    if (cmp_values(&argv[1], &a->items[0]) <= 0) return argv[1];
+
+    Value result = a->items[0];
+    a->items[0] = argv[1];
+    sift_down(a->items, 0, a->count - 1);
+    return result;
 }
 
-static Value native_heapreplace(int argc, Value* argv) {
-    if (argc < 2 || argv[0].type != VAL_ARRAY)
-        return make_error("heapq.heapreplace(arr, val) requires array and value");
+static Value native_heapreplace(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    if (argc < 2 || argv[0].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_heapreplace(arr, val) requires an array and a value\n");
+        return make_null();
+    }
 
-    Value* arr_val = &argv[0];
-    int n = arr_val->as.array.length;
-    if (n == 0) return make_error("heapq.heapreplace: heap is empty");
+    Array* a = argv[0].array_val;
+    if (a->count == 0) {
+        fprintf(stderr, "Error: heapq_heapreplace: heap is empty\n");
+        return make_null();
+    }
 
-    Value result = arr_val->as.array.values[0];
-    arr_val->as.array.values[0] = argv[1];
-    sift_down(arr_val->as.array.values, 0, n - 1);
-
+    Value result = a->items[0];
+    a->items[0] = argv[1];
+    sift_down(a->items, 0, a->count - 1);
     return result;
 }
 
 static int cmp_for_sort(const void* a, const void* b) {
-    double da, db;
-    Value* va = (Value*)a;
-    Value* vb = (Value*)b;
-    da = (va->type == VAL_FLOAT) ? va->as.floating : (va->type == VAL_INT) ? (double)va->as.integer : 0;
-    db = (vb->type == VAL_FLOAT) ? vb->as.floating : (vb->type == VAL_INT) ? (double)vb->as.integer : 0;
-    return (da > db) - (da < db);
+    return cmp_values((const Value*)a, (const Value*)b);
 }
 
-static Value native_nlargest(int argc, Value* argv) {
-    if (argc < 2 || argv[0].type != VAL_INT || argv[1].type != VAL_ARRAY)
-        return make_error("heapq.nlargest(n, arr) requires int and array");
+/* Shared implementation for nlargest/nsmallest: returns a NEW array */
+static Value nselect(int argc, Value* argv, int largest) {
+    if (argc < 2 || argv[0].type != VAL_INT || argv[1].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_n%s(n, arr) requires an int and an array\n",
+                largest ? "largest" : "smallest");
+        return make_null();
+    }
 
-    int k = (int)argv[0].as.integer;
-    int n = argv[1].as.array.length;
-    if (k > n) k = n;
-    if (k <= 0) return make_string("");
+    long long k = argv[0].int_val;
+    size_t n = argv[1].array_val->count;
+    if (k > (long long)n) k = (long long)n;
+    if (k <= 0) return make_array_value(array_create(0));
 
-    /* Copy and sort descending */
+    /* Copy and sort ascending */
     Value* copy = malloc(sizeof(Value) * n);
-    if (!copy) return make_error("heapq.nlargest: out of memory");
-    memcpy(copy, argv[1].as.array.values, sizeof(Value) * n);
+    if (!copy) {
+        fprintf(stderr, "Error: heapq_n%s: out of memory\n", largest ? "largest" : "smallest");
+        return make_null();
+    }
+    memcpy(copy, argv[1].array_val->items, sizeof(Value) * n);
     qsort(copy, n, sizeof(Value), cmp_for_sort);
 
-    /* Build result string (largest first) */
-    char buf[1024] = "";
-    int pos = 0;
-    for (int i = 0; i < k; i++) {
-        if (i > 0) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
-        Value v = copy[n - 1 - i];
-        if (v.type == VAL_INT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld", v.as.integer);
-        else if (v.type == VAL_FLOAT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%.6g", v.as.floating);
+    Array* out = array_create((size_t)k);
+    for (long long i = 0; i < k; i++) {
+        /* largest: take from the end (descending); smallest: from the front */
+        array_push(out, copy[largest ? (long long)n - 1 - i : i]);
     }
     free(copy);
-    return make_string(buf);
+
+    return make_array_value(out);
 }
 
-static Value native_nsmallest(int argc, Value* argv) {
-    if (argc < 2 || argv[0].type != VAL_INT || argv[1].type != VAL_ARRAY)
-        return make_error("heapq.nsmallest(n, arr) requires int and array");
+static Value native_nlargest(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    return nselect(argc, argv, 1);
+}
 
-    int k = (int)argv[0].as.integer;
-    int n = argv[1].as.array.length;
-    if (k > n) k = n;
-    if (k <= 0) return make_string("");
+static Value native_nsmallest(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    return nselect(argc, argv, 0);
+}
 
-    Value* copy = malloc(sizeof(Value) * n);
-    if (!copy) return make_error("heapq.nsmallest: out of memory");
-    memcpy(copy, argv[1].as.array.values, sizeof(Value) * n);
-    qsort(copy, n, sizeof(Value), cmp_for_sort);
-
-    char buf[1024] = "";
-    int pos = 0;
-    for (int i = 0; i < k; i++) {
-        if (i > 0) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
-        Value v = copy[i];
-        if (v.type == VAL_INT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld", v.as.integer);
-        else if (v.type == VAL_FLOAT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%.6g", v.as.floating);
+/* Merge two sorted arrays into a new sorted array */
+static Value native_merge(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    if (argc < 2 || argv[0].type != VAL_ARRAY || argv[1].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_merge(a, b) requires two arrays\n");
+        return make_null();
     }
-    free(copy);
-    return make_string(buf);
-}
 
-static Value native_merge(int argc, Value* argv) {
-    if (argc < 2 || argv[0].type != VAL_ARRAY || argv[1].type != VAL_ARRAY)
-        return make_error("heapq.merge(a, b) requires two arrays");
+    Array* a = argv[0].array_val;
+    Array* b = argv[1].array_val;
+    Array* out = array_create(a->count + b->count + 1);
 
-    int na = argv[0].as.array.length;
-    int nb = argv[1].as.array.length;
-
-    char buf[2048] = "";
-    int pos = 0, ia = 0, ib = 0, first = 1;
-
-    while (ia < na && ib < nb) {
-        if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
-        first = 0;
-        if (cmp_values(argv[0].as.array.values[ia], argv[1].as.array.values[ib]) <= 0) {
-            Value v = argv[0].as.array.values[ia++];
-            if (v.type == VAL_INT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld", v.as.integer);
-            else pos += snprintf(buf + pos, sizeof(buf) - pos, "%.6g", v.as.floating);
+    size_t ia = 0, ib = 0;
+    while (ia < a->count && ib < b->count) {
+        if (cmp_values(&a->items[ia], &b->items[ib]) <= 0) {
+            array_push(out, a->items[ia++]);
         } else {
-            Value v = argv[1].as.array.values[ib++];
-            if (v.type == VAL_INT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld", v.as.integer);
-            else pos += snprintf(buf + pos, sizeof(buf) - pos, "%.6g", v.as.floating);
+            array_push(out, b->items[ib++]);
         }
     }
-    while (ia < na) {
-        if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
-        first = 0;
-        Value v = argv[0].as.array.values[ia++];
-        if (v.type == VAL_INT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld", v.as.integer);
-        else pos += snprintf(buf + pos, sizeof(buf) - pos, "%.6g", v.as.floating);
-    }
-    while (ib < nb) {
-        if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
-        first = 0;
-        Value v = argv[1].as.array.values[ib++];
-        if (v.type == VAL_INT) pos += snprintf(buf + pos, sizeof(buf) - pos, "%lld", v.as.integer);
-        else pos += snprintf(buf + pos, sizeof(buf) - pos, "%.6g", v.as.floating);
-    }
-    return make_string(buf);
+    while (ia < a->count) array_push(out, a->items[ia++]);
+    while (ib < b->count) array_push(out, b->items[ib++]);
+
+    return make_array_value(out);
 }
 
-static Value native_is_heap(int argc, Value* argv) {
-    if (argc < 1 || argv[0].type != VAL_ARRAY)
-        return make_error("heapq.is_heap(arr) requires an array");
+static Value native_is_heap(struct Interpreter* interp, int argc, Value* argv) {
+    (void)interp;
+    if (argc < 1 || argv[0].type != VAL_ARRAY) {
+        fprintf(stderr, "Error: heapq_is_heap(arr) requires an array\n");
+        return make_int(0);
+    }
 
-    int n = argv[0].as.array.length;
-    Value* arr = argv[0].as.array.values;
-
-    for (int i = 0; i < n; i++) {
-        int left = 2 * i + 1;
-        int right = 2 * i + 2;
-        if (left < n && cmp_values(arr[i], arr[left]) > 0) return make_int(0);
-        if (right < n && cmp_values(arr[i], arr[right]) > 0) return make_int(0);
+    Array* a = argv[0].array_val;
+    for (size_t i = 0; i < a->count; i++) {
+        size_t left = 2 * i + 1;
+        size_t right = 2 * i + 2;
+        if (left < a->count && cmp_values(&a->items[i], &a->items[left]) > 0) return make_int(0);
+        if (right < a->count && cmp_values(&a->items[i], &a->items[right]) > 0) return make_int(0);
     }
     return make_int(1);
 }
