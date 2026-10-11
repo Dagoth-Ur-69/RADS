@@ -8,6 +8,7 @@ extern Value make_int(long long val);
 extern Value make_string(const char* val);
 extern Value make_bool(bool val);
 extern Value make_null(void);
+extern Value value_clone(Value v); // owning-reference helper for natives
 extern Value interpreter_execute_callback(Value callback, int argc, Value* args);
 
 // ANSI Color codes
@@ -145,7 +146,7 @@ Value stdlib_test_expect(Interpreter* interp, int argc, Value* args) {
     }
     
     // Return the value so we can chain .toBe(), etc.
-    return args[0];
+    return value_clone(args[0]); // owning ref (caller frees args)
 }
 
 // Helper: Compare values for equality

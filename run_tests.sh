@@ -26,6 +26,7 @@ test_files=(
     "test_debugger.rads"
     "test_typecheck.rads"
     "test_recursion.rads"
+    "test_array_uaf.rads"
 )
 
 for test_file in "${test_files[@]}"; do

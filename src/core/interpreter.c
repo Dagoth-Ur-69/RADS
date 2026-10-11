@@ -83,7 +83,7 @@ Array* array_create(size_t capacity) {
     return arr;
 }
 
-static Value value_clone(Value v);
+static Value value_clone_impl(Value v);
 static void value_release(Value* v);
 
 void array_push(Array* arr, Value v) {
@@ -91,7 +91,7 @@ void array_push(Array* arr, Value v) {
         arr->capacity = arr->capacity * 2;
         arr->items = realloc(arr->items, arr->capacity * sizeof(Value));
     }
-    arr->items[arr->count++] = value_clone(v);
+    arr->items[arr->count++] = value_clone_impl(v);
 }
 
 static Value make_array_from_list(ASTList* elements) {
@@ -120,7 +120,7 @@ static Value make_array_from_list(ASTList* elements) {
     return v;
 }
 
-static Value value_clone(Value v) {
+static Value value_clone_impl(Value v) {
     Value out = v;
     switch (v.type) {
         case VAL_STRING:
@@ -142,7 +142,7 @@ static Value value_clone(Value v) {
                     FieldValue* new_field = malloc(sizeof(FieldValue));
                     new_field->name = strdup(current->name);
                     new_field->value = malloc(sizeof(Value));
-                    *new_field->value = value_clone(*current->value);
+                    *new_field->value = value_clone_impl(*current->value);
                     new_field->next = NULL;
                     *tail = new_field;
                     tail = &new_field->next;
@@ -156,6 +156,9 @@ static Value value_clone(Value v) {
     }
     return out;
 }
+
+// Public wrapper: natives must return owning references (see interpreter.h).
+Value value_clone(Value v) { return value_clone_impl(v); }
 
 static void value_release(Value* value) {
     if (!value) return;
@@ -266,7 +269,7 @@ static EnvFrame* env_frame = NULL; // NULL = executing at global scope
 
 static void env_list_set(Environment** list, const char* name, Value value) {
     // Always clone the value to ensure proper ownership
-    Value cloned_value = value_clone(value);
+    Value cloned_value = value_clone_impl(value);
 
     // Check existing
     Environment* current = *list;
@@ -294,7 +297,7 @@ static bool env_list_get(Environment* list, const char* name, Value* out) {
     while (current) {
         if (strcmp(current->name, name) == 0) {
             // Return a clone to ensure proper ownership
-            *out = value_clone(current->value);
+            *out = value_clone_impl(current->value);
             return true;
         }
         current = current->next;
@@ -322,7 +325,7 @@ static void env_set(const char* name, Value value) {
         for (Environment* current = f->locals; current; current = current->next) {
             if (strcmp(current->name, name) == 0) {
                 value_free(&current->value);
-                current->value = value_clone(value);
+                current->value = value_clone_impl(value);
                 return;
             }
         }
@@ -330,7 +333,7 @@ static void env_set(const char* name, Value value) {
     for (Environment* current = global_env; current; current = current->next) {
         if (strcmp(current->name, name) == 0) {
             value_free(&current->value);
-            current->value = value_clone(value);
+            current->value = value_clone_impl(value);
             return;
         }
     }
@@ -538,7 +541,7 @@ static Value eval_call(ASTNode* node) {
                 // arr.pop() - remove and return last element
                 Value result = make_null();
                 if (obj_val.array_val->count > 0) {
-                    result = value_clone(obj_val.array_val->items[obj_val.array_val->count - 1]);
+                    result = value_clone_impl(obj_val.array_val->items[obj_val.array_val->count - 1]);
                     value_release(&obj_val.array_val->items[obj_val.array_val->count - 1]);
                     obj_val.array_val->count--;
                 }
@@ -554,7 +557,7 @@ static Value eval_call(ASTNode* node) {
             if (native) {
                 int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
                 Value* args = malloc(sizeof(Value) * (argc + 1));
-                args[0] = value_clone(obj_val);
+                args[0] = value_clone_impl(obj_val);
                 for (int i = 0; i < argc; i++) {
                     args[i + 1] = eval_expression(node->call_expr.arguments->nodes[i]);
                 }
@@ -982,7 +985,7 @@ static Value eval_expression(ASTNode* node) {
                 FieldValue* current = object.struct_instance->fields;
                 while (current) {
                     if (strcmp(current->name, member_name) == 0) {
-                        Value result = value_clone(*current->value);
+                        Value result = value_clone_impl(*current->value);
                         value_release(&object);
                         return result;
                     }
@@ -1021,7 +1024,7 @@ static Value eval_expression(ASTNode* node) {
                             if (strcmp(current->name, member_name) == 0) {
                                 value_release(current->value);
                                 current->value = malloc(sizeof(Value));
-                                *current->value = value_clone(value);
+                                *current->value = value_clone_impl(value);
                                 break;
                             }
                             current = current->next;
@@ -1037,7 +1040,7 @@ static Value eval_expression(ASTNode* node) {
                             if (strcmp(current->name, member_name) == 0) {
                                 value_release(current->value);
                                 current->value = malloc(sizeof(Value));
-                                *current->value = value_clone(value);
+                                *current->value = value_clone_impl(value);
                                 break;
                             }
                             current = current->next;
@@ -1112,7 +1115,7 @@ static Value eval_expression(ASTNode* node) {
                     FieldValue* current = object.struct_instance->fields;
                     while (current) {
                         if (strcmp(current->name, member_name) == 0) {
-                            result = value_clone(*current->value);
+                            result = value_clone_impl(*current->value);
                             break;
                         }
                         current = current->next;
@@ -1126,7 +1129,7 @@ static Value eval_expression(ASTNode* node) {
                 Value idx = eval_expression(node->optional_chain.index);
                 if (object.type == VAL_ARRAY && idx.type == VAL_INT) {
                     if (idx.int_val >= 0 && (size_t)idx.int_val < object.array_val->count) {
-                        result = value_clone(object.array_val->items[idx.int_val]);
+                        result = value_clone_impl(object.array_val->items[idx.int_val]);
                     }
                 }
                 value_free(&idx);
@@ -1334,7 +1337,7 @@ static ExecResult exec_statement(ASTNode* node) {
             if (has_return_value) {
                 value_free(&current_return_value);
             }
-            current_return_value = value_clone(rv);
+            current_return_value = value_clone_impl(rv);
             has_return_value = true;
             value_free(&rv);
             return EXEC_RETURN;
@@ -1348,7 +1351,7 @@ static ExecResult exec_statement(ASTNode* node) {
             if (has_thrown_value) {
                 value_free(&thrown_value);
             }
-            thrown_value = value_clone(tv);
+            thrown_value = value_clone_impl(tv);
             has_thrown_value = true;
             value_free(&tv);
             return EXEC_THROW;
@@ -1500,7 +1503,7 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
             if (param_node->type == AST_VARIABLE_DECL) {
                 pname = param_node->variable_decl.name;
                 if (i < argc && args) {
-                    arg = value_clone(args[i]);
+                    arg = value_clone_impl(args[i]);
                 } else if (param_node->variable_decl.initializer) {
                     arg = eval_expression(param_node->variable_decl.initializer);
                 } else {
@@ -1508,7 +1511,7 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
                 }
             } else {
                 pname = param_node->identifier.name;
-                arg = (i < argc && args) ? value_clone(args[i]) : make_null();
+                arg = (i < argc && args) ? value_clone_impl(args[i]) : make_null();
             }
             env_decl(pname, arg);
             value_free(&arg);
@@ -1518,7 +1521,7 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
     env_frame = frame.next; // pop frame (locals freed below)
     Value rv;
     if (r == EXEC_RETURN && has_return_value) {
-        rv = value_clone(current_return_value);
+        rv = value_clone_impl(current_return_value);
     } else {
         rv = make_null();
     }
