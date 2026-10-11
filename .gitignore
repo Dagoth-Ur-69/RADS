@@ -346,3 +346,4 @@ cscope.files
 /radpkg
 /rads-mask
 /tools/rads-mask/rads-mask
+benchmarks/tmp_io_*.txt
