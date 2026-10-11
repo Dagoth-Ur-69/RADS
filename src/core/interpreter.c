@@ -392,21 +392,44 @@ static void env_free() {
     global_env = NULL;
 }
 
-// Native function registry
+// Native function registry — open-addressing hash table (FNV-1a).
+// RADS registers ~680 natives; the old linear list made find_native() a
+// several-hundred-strcmp walk on EVERY call expression (including the miss
+// path that precedes every user-function call), which dominated recursive
+// call-heavy workloads (fib: 3050ms vs CPython 57ms).
 typedef struct NativeBinding {
-    char* name;
+    const char* name; // owned
     NativeFn fn;
-    struct NativeBinding* next;
 } NativeBinding;
 
-static NativeBinding* native_functions = NULL;
+#define NATIVE_TABLE_SIZE 2048 // power of two; ~680 natives -> ~33% load
+static NativeBinding native_table[NATIVE_TABLE_SIZE];
+// 0 = empty, 1 = occupied (fn pointer alone cannot mark empties: NULL fn is legal)
+static unsigned char native_used[NATIVE_TABLE_SIZE];
+static size_t native_count = 0;
+
+static size_t native_hash(const char* name) {
+    size_t h = 1469598103934665603ull;
+    while (*name) {
+        h ^= (unsigned char)*name++;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
 
 void register_native(const char* name, NativeFn fn) {
-    NativeBinding* binding = malloc(sizeof(NativeBinding));
-    binding->name = strdup(name);
-    binding->fn = fn;
-    binding->next = native_functions;
-    native_functions = binding;
+    size_t i = native_hash(name) & (NATIVE_TABLE_SIZE - 1);
+    while (native_used[i]) {
+        if (strcmp(native_table[i].name, name) == 0) {
+            native_table[i].fn = fn; // re-registration overwrites
+            return;
+        }
+        i = (i + 1) & (NATIVE_TABLE_SIZE - 1);
+    }
+    native_table[i].name = strdup(name);
+    native_table[i].fn = fn;
+    native_used[i] = 1;
+    native_count++;
 }
 
 void register_native_fn(const char* module, const char* name, NativeFn fn) {
@@ -421,12 +444,12 @@ void register_native_fn(const char* module, const char* name, NativeFn fn) {
 }
 
 static NativeFn find_native(const char* name) {
-    NativeBinding* current = native_functions;
-    while (current) {
-        if (strcmp(current->name, name) == 0) {
-            return current->fn;
+    size_t i = native_hash(name) & (NATIVE_TABLE_SIZE - 1);
+    while (native_used[i]) {
+        if (strcmp(native_table[i].name, name) == 0) {
+            return native_table[i].fn;
         }
-        current = current->next;
+        i = (i + 1) & (NATIVE_TABLE_SIZE - 1);
     }
     return NULL;
 }
