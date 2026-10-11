@@ -42,6 +42,35 @@ static int starts_with(const char* str, const char* prefix) {
     return strncmp(str, prefix, strlen(prefix)) == 0;
 }
 
+/*
+ * find_assignment() — locate a real Python assignment '=' in a statement.
+ * Why: a bare '=' is an assignment, but '==', '!=', '<=', '>=', ':=' and
+ * keyword-arguments ('foo(x=1)') must NOT be treated as one. The old code
+ * checked the char BEFORE the first '=', which wrongly captured the second
+ * '=' of 'a == b' and mangled it into 'turbo a = = b'.
+ * How to extend: add more operator exceptions to the skip-conditions, or
+ * teach the paren-depth check about brackets/braces for slice defaults.
+ */
+static char* find_assignment(const char* s) {
+    int paren_depth = 0;
+    for (const char* p = s; *p; p++) {
+        if (*p == '(') paren_depth++;
+        else if (*p == ')' && paren_depth > 0) paren_depth--;
+        else if (*p == '=' && paren_depth == 0) {
+            /* skip ==, !=, <=, >=, := ; guard p[-1] at string start (UB) */
+            if (p[1] == '=' ||
+                (p > s && (p[-1] == '=' || p[-1] == '!' ||
+                           p[-1] == '<' || p[-1] == '>' || p[-1] == ':'))) {
+                p++; /* skip the pair so '==' is not re-examined */
+                continue;
+            }
+            return (char*)p;
+        }
+    }
+    return NULL;
+}
+
+
 static void replace_in_line(char* line, const char* from, const char* to) {
     char buffer[MAX_LINE_LENGTH];
     char* pos = line;
@@ -106,33 +135,27 @@ static void transpile_line(const char* input, char* output, int* indent_level) {
 
     // Rule 2: Variable assignment with type inference
     // Python: x = 42  → RADS: turbo x = 42;
-    char* equals = strchr(converted, '=');
-    if (equals) {
-        // Check if it's not a comparison and no parens before equals
-        if (*(equals - 1) != '=' && *(equals - 1) != '!' &&
-            *(equals - 1) != '<' && *(equals - 1) != '>') {
-
-            // Check if there are parentheses before the equals (like function def)
-            int has_paren_before = 0;
-            for (char* p = converted; p < equals; p++) {
-                if (*p == '(') {
-                    has_paren_before = 1;
-                    break;
-                }
-            }
-
-            if (!has_paren_before) {
-                char var_name[256];
-                char* start = converted;
-                while (isspace(*start)) start++;
-                char* end = equals - 1;
-                while (end > start && isspace(*end)) end--;
-                int len = end - start + 1;
+    // Uses find_assignment() so comparisons (==) and kwargs are not mangled.
+    // 'return x = ...' can't happen in Python, but 'return x == y' must not
+    // be captured here — Rule 8 runs first (moved below its check).
+    if (!starts_with(converted, "return")) {
+        char* equals = find_assignment(converted);
+        if (equals) {
+            char var_name[256];
+            char* start = converted;
+            while (isspace((unsigned char)*start)) start++;
+            char* end = equals - 1;
+            while (end > start && isspace((unsigned char)*end)) end--;
+            int len = (int)(end - start) + 1;
+            if (len > 0 && len < (int)sizeof(var_name)) {
                 strncpy(var_name, start, len);
                 var_name[len] = '\0';
 
                 char* value = equals + 1;
-                while (isspace(*value)) value++;
+                while (isspace((unsigned char)*value)) value++;
+
+                /* strip trailing newline carriage leftovers before formatting */
+                trim(converted);
 
                 // Always use turbo for variable declarations
                 sprintf(output + strlen(output), "turbo %s = %s;", var_name, value);
@@ -178,9 +201,9 @@ static void transpile_line(const char* input, char* output, int* indent_level) {
             replace_in_line(condition, "True", "true");
             replace_in_line(condition, "False", "false");
 
-            // Reduce indent for closing brace
+            // Reduce indent for closing brace — align with the opening 'if'
             output[0] = '\0';
-            for (int i = 0; i < new_indent - 1; i++) {
+            for (int i = 0; i < new_indent; i++) {
                 strcat(output, "    ");
             }
             sprintf(output + strlen(output), "} elif (%s) {", condition);
@@ -246,6 +269,11 @@ static void transpile_line(const char* input, char* output, int* indent_level) {
 
     // Rule 8: return value → return value;
     if (starts_with(converted, "return")) {
+        /* Python literal names differ in RADS — convert them so
+         * 'return True' doesn't leak Python keywords into RADS code. */
+        replace_in_line(converted, "True", "true");
+        replace_in_line(converted, "False", "false");
+        replace_in_line(converted, "None", "null");
         sprintf(output + strlen(output), "%s;", converted);
         trim(output);
         return;
@@ -309,11 +337,32 @@ int transpile_python_to_rads(FILE* input, FILE* output) {
 
     while (fgets(line, sizeof(line), input)) {
         line_number++;
+
+        /* strip trailing newline/CR so rules never embed '\n' mid-statement
+         * (this was the cause of stray lone ';' lines after echo/return) */
+        size_t llen = strlen(line);
+        while (llen > 0 && (line[llen - 1] == '\n' || line[llen - 1] == '\r')) {
+            line[--llen] = '\0';
+        }
+
         int current_indent = count_leading_spaces(line) / 4;
 
-        // Handle dedents (closing braces)
+        /* 'elif'/'else' emit their own leading '}' (RADS: "} elif (...) {"),
+         * so the generic dedent closer must not run for them — running both
+         * produced a double '}' before every elif/else chain link. */
+        const char* first_token = line + count_leading_spaces(line);
+        int continues_chain = starts_with(first_token, "elif ") ||
+                              strcmp(first_token, "else:") == 0;
+
+        // Handle dedents (closing braces).
+        // 'elif'/'else' lines print their own leading '}' which closes the
+        // immediately-enclosing body, so the generic closer must emit only
+        // (dedent_count - 1) braces for them — none when the chain continues
+        // at the same nesting level, extra ones when dedenting out of nested
+        // blocks (e.g. inner 'else:' followed by outer 'elif:').
         if (current_indent < prev_indent) {
             int dedent_count = prev_indent - current_indent;
+            if (continues_chain) dedent_count--;
             for (int i = 0; i < dedent_count; i++) {
                 for (int j = 0; j < prev_indent - i - 1; j++) {
                     fprintf(output, "    ");
