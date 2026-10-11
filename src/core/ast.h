@@ -241,6 +241,15 @@ struct ASTNode {
         struct {
             ASTNode* callee;
             ASTList* arguments;
+            // Callee-resolution cache (perf; written only by eval_call in
+            // interpreter.c). Valid only when cache_gen matches the interned
+            // name's current generation and cache_native_gen matches the
+            // native table's generation.
+            const void* cache_binding; // Environment* in global_env, or NULL
+            void* cache_native;        // NativeFn, or NULL
+            const char* cache_iname;   // interned callee name
+            unsigned cache_gen;        // name generation at cache time (0 = empty)
+            unsigned cache_native_gen; // native-table generation at cache time
         } call_expr;
         
         // Assignment

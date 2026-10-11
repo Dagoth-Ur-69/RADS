@@ -281,20 +281,33 @@ static size_t native_hash(const char* name); // defined with the native registry
 #define ENVNAME_TABLE_SIZE 1024 // power of two
 typedef struct EnvNameEntry {
     const char* name; // owned, strdup'd once, lives for the process
+    // Invalidation generation for the per-call-node callee cache (eval_call):
+    // bumped whenever a function binding for this name is written, and when
+    // the name first becomes "frameable" (bound into a call frame — such
+    // names are resolved dynamically and never cached). Starts at 1; 0 is
+    // the cache-empty sentinel on AST nodes.
+    unsigned gen;
+    bool frameable; // true once this name has EVER been bound into a frame
     struct EnvNameEntry* next;
 } EnvNameEntry;
 static EnvNameEntry* envname_table[ENVNAME_TABLE_SIZE];
 
-static const char* env_intern(const char* name) {
+static EnvNameEntry* env_intern_entry(const char* name) {
     size_t h = native_hash(name) & (ENVNAME_TABLE_SIZE - 1);
     for (EnvNameEntry* e = envname_table[h]; e; e = e->next) {
-        if (strcmp(e->name, name) == 0) return e->name;
+        if (strcmp(e->name, name) == 0) return e;
     }
     EnvNameEntry* e = malloc(sizeof(EnvNameEntry));
     e->name = strdup(name);
+    e->gen = 1;
+    e->frameable = false;
     e->next = envname_table[h];
     envname_table[h] = e;
-    return e->name;
+    return e;
+}
+
+static const char* env_intern(const char* name) {
+    return env_intern_entry(name)->name;
 }
 
 // Call-frame scopes: parameters and function locals live in a frame so that
@@ -312,7 +325,8 @@ static EnvFrame* env_frame = NULL; // NULL = executing at global scope
 
 // Takes ownership of `value`. `name` is interned (never freed per-node).
 static void env_list_set(Environment** list, const char* name, Value value) {
-    const char* iname = env_intern(name);
+    EnvNameEntry* entry = env_intern_entry(name);
+    const char* iname = entry->name;
 
     // Check existing
     Environment* current = *list;
@@ -325,7 +339,17 @@ static void env_list_set(Environment** list, const char* name, Value value) {
         current = current->next;
     }
 
-    // Create new
+    // Create new. A fresh binding node invalidates any cached resolution of
+    // this name (eval_call caches global Environment pointers / "absent").
+    entry->gen++;
+    if (list != &global_env) {
+        // Bound into a call frame: this name can now be shadowed dynamically
+        // and must never be statically cached afterwards.
+        if (!entry->frameable) {
+            entry->frameable = true;
+            entry->gen++;
+        }
+    }
     Environment* env = env_node_alloc();
     env->name = iname;
     env->value = value;
@@ -457,6 +481,8 @@ static NativeBinding native_table[NATIVE_TABLE_SIZE];
 // 0 = empty, 1 = occupied (fn pointer alone cannot mark empties: NULL fn is legal)
 static unsigned char native_used[NATIVE_TABLE_SIZE];
 static size_t native_count = 0;
+// Bumped on every registration; call-node callee caches validate against it.
+static unsigned native_gen = 1;
 
 static size_t native_hash(const char* name) {
     size_t h = 1469598103934665603ull;
@@ -472,6 +498,7 @@ void register_native(const char* name, NativeFn fn) {
     while (native_used[i]) {
         if (strcmp(native_table[i].name, name) == 0) {
             native_table[i].fn = fn; // re-registration overwrites
+            native_gen++;
             return;
         }
         i = (i + 1) & (NATIVE_TABLE_SIZE - 1);
@@ -480,6 +507,7 @@ void register_native(const char* name, NativeFn fn) {
     native_table[i].fn = fn;
     native_used[i] = 1;
     native_count++;
+    native_gen++;
 }
 
 void register_native_fn(const char* module, const char* name, NativeFn fn) {
@@ -658,8 +686,55 @@ static Value eval_call(ASTNode* node) {
     }
     
     if (name) {
-        // Check for native function
-        NativeFn native = find_native(name);
+        // --- Callee resolution, cached on the call node (perf round 3) ---
+        // A pure-identifier callee whose name has NEVER been bound into a
+        // call frame resolves statically: the global binding node (or its
+        // absence) is stable — bindings update in place — so the resolution
+        // is cached on this AST node and invalidated by the name's
+        // generation (bumped on any fresh binding) or the native table's
+        // generation. Frameable names are always resolved dynamically.
+        NativeFn native = NULL;
+        Environment* callee_binding = NULL; // borrowed; never freed here
+        EnvNameEntry* cache_entry = NULL;
+
+        if (!full_name && node->call_expr.callee->type == AST_IDENTIFIER) {
+            cache_entry = env_intern_entry(name);
+            if (cache_entry->frameable) {
+                cache_entry = NULL; // dynamic: never cache
+            } else if (node->call_expr.cache_iname == cache_entry->name &&
+                       node->call_expr.cache_gen == cache_entry->gen &&
+                       node->call_expr.cache_native_gen == native_gen) {
+                native = (NativeFn)node->call_expr.cache_native;
+                callee_binding = (Environment*)node->call_expr.cache_binding;
+                goto resolved;
+            }
+        }
+
+        native = find_native(name);
+        if (!native) {
+            // Borrowed lookup (frames first, then globals) — the old path
+            // cloned the callee Value on every call. We snapshot the Value
+            // before evaluating arguments; VAL_FUNCTION is trivially
+            // copyable (func_node is program-lifetime AST).
+            const char* iname = env_intern(name);
+            for (EnvFrame* f = env_frame; f && !callee_binding; f = f->next) {
+                for (Environment* c = f->locals; c; c = c->next) {
+                    if (c->name == iname) { callee_binding = c; break; }
+                }
+            }
+            for (Environment* c = global_env; c && !callee_binding; c = c->next) {
+                if (c->name == iname) { callee_binding = c; break; }
+            }
+        }
+        if (cache_entry) {
+            node->call_expr.cache_iname = cache_entry->name;
+            node->call_expr.cache_gen = cache_entry->gen;
+            node->call_expr.cache_native_gen = native_gen;
+            node->call_expr.cache_native = (void*)native;
+            node->call_expr.cache_binding = callee_binding;
+        }
+
+resolved:
         if (native) {
              int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
             Value stack_args[8];
@@ -679,11 +754,13 @@ static Value eval_call(ASTNode* node) {
             if (full_name) free(full_name);
             return result;
         }
-        
-        // Check for user function in environment
-        Value func_val = env_get(name);
-        if (func_val.type == VAL_FUNCTION) {
-            // Call the function with parameters and return value support
+
+        if (callee_binding && callee_binding->value.type == VAL_FUNCTION) {
+            // Snapshot before arg evaluation: a rebinding during argument
+            // eval updates the binding node in place; the snapshot (and its
+            // program-lifetime func_node) stays valid regardless.
+            Value func_snapshot = callee_binding->value; // borrowed
+
             int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
             Value stack_args[8];
             Value* args = (argc <= 8) ? stack_args : malloc(sizeof(Value) * (argc > 0 ? argc : 1));
@@ -692,18 +769,16 @@ static Value eval_call(ASTNode* node) {
                 args[i] = eval_expression(node->call_expr.arguments->nodes[i]);
             }
 
-            Value result = interpreter_execute_callback(func_val, argc, args);
+            Value result = interpreter_execute_callback(func_snapshot, argc, args);
 
-            // Cleanup args
+            // Cleanup args (callee value is borrowed — nothing to free)
             for (int i = 0; i < argc; i++) {
                 value_free(&args[i]);
             }
             if (args != stack_args) free(args);
-            value_free(&func_val);
             if (full_name) free(full_name);
             return result;
         }
-        value_free(&func_val);
 
         if (full_name) free(full_name);
     }
@@ -1414,9 +1489,8 @@ static ExecResult exec_statement(ASTNode* node) {
             if (has_return_value) {
                 value_free(&current_return_value);
             }
-            current_return_value = value_clone_impl(rv);
+            current_return_value = rv; // move: rv is owned here
             has_return_value = true;
-            value_free(&rv);
             return EXEC_RETURN;
         }
         
@@ -1597,7 +1671,8 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
     env_frame = frame.next; // pop frame (locals freed below)
     Value rv;
     if (r == EXEC_RETURN && has_return_value) {
-        rv = value_clone_impl(current_return_value);
+        rv = current_return_value; // move: callee consumed it
+        has_return_value = false;
     } else {
         rv = make_null();
     }
