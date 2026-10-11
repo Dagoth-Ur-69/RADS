@@ -247,12 +247,55 @@ void value_free(Value* value) { value_release(value); }
 
 // Environment (Variables)
 typedef struct Environment {
-    char* name;
+    const char* name; // interned (see env_intern) — never freed per-node
     Value value;
     struct Environment* next;
 } Environment;
 
 static Environment* global_env = NULL;
+
+// --- Call-frame hot-path allocators ---
+// A fib(28) run makes ~832k user calls; every parameter bind used to cost a
+// malloc(Environment) + strdup(name) and every frame pop a matching pair of
+// frees. Two fixes: (1) names are interned in a small hash set — binding
+// names are identifier strings that repeat heavily and live forever anyway;
+// (2) Environment nodes are recycled through a free-list instead of freed.
+static Environment* env_node_pool = NULL;
+
+static Environment* env_node_alloc(void) {
+    if (env_node_pool) {
+        Environment* e = env_node_pool;
+        env_node_pool = e->next;
+        return e;
+    }
+    return malloc(sizeof(Environment));
+}
+
+static void env_node_release(Environment* e) {
+    e->next = env_node_pool;
+    env_node_pool = e;
+}
+
+static size_t native_hash(const char* name); // defined with the native registry
+
+#define ENVNAME_TABLE_SIZE 1024 // power of two
+typedef struct EnvNameEntry {
+    const char* name; // owned, strdup'd once, lives for the process
+    struct EnvNameEntry* next;
+} EnvNameEntry;
+static EnvNameEntry* envname_table[ENVNAME_TABLE_SIZE];
+
+static const char* env_intern(const char* name) {
+    size_t h = native_hash(name) & (ENVNAME_TABLE_SIZE - 1);
+    for (EnvNameEntry* e = envname_table[h]; e; e = e->next) {
+        if (strcmp(e->name, name) == 0) return e->name;
+    }
+    EnvNameEntry* e = malloc(sizeof(EnvNameEntry));
+    e->name = strdup(name);
+    e->next = envname_table[h];
+    envname_table[h] = e;
+    return e->name;
+}
 
 // Call-frame scopes: parameters and function locals live in a frame so that
 // recursive/nested calls cannot clobber each other's variables (frame locals
@@ -267,37 +310,38 @@ typedef struct EnvFrame {
 
 static EnvFrame* env_frame = NULL; // NULL = executing at global scope
 
+// Takes ownership of `value`. `name` is interned (never freed per-node).
 static void env_list_set(Environment** list, const char* name, Value value) {
-    // Always clone the value to ensure proper ownership
-    Value cloned_value = value_clone_impl(value);
+    const char* iname = env_intern(name);
 
     // Check existing
     Environment* current = *list;
     while (current) {
-        if (strcmp(current->name, name) == 0) {
+        if (current->name == iname || strcmp(current->name, name) == 0) {
             value_free(&current->value); // Free old value
-            current->value = cloned_value;
+            current->value = value;
             return;
         }
         current = current->next;
     }
 
     // Create new
-    Environment* env = malloc(sizeof(Environment));
-    env->name = strdup(name);
-    env->value = cloned_value;
+    Environment* env = env_node_alloc();
+    env->name = iname;
+    env->value = value;
     env->next = *list;
     *list = env;
 }
 
 // Find a name in a list; returns false if absent (a stored null value is a
-// real value and must be distinguishable from "not found").
+// real value and must be distinguishable from "not found"). `name` must be
+// an interned name (env_intern) — comparison is pointer equality.
 static bool env_list_get(Environment* list, const char* name, Value* out) {
     Environment* current = list;
     while (current) {
-        if (strcmp(current->name, name) == 0) {
+        if (current->name == name) {
             // Return a clone to ensure proper ownership
-            *out = value_clone_impl(current->value);
+            *out = value_clone_impl(*&current->value);
             return true;
         }
         current = current->next;
@@ -309,9 +353,9 @@ static void env_list_free(Environment** list) {
     Environment* current = *list;
     while (current) {
         Environment* next = current->next;
-        free(current->name);
+        // name is interned — never freed per-node
         value_free(&current->value);
-        free(current);
+        env_node_release(current);
         current = next;
     }
     *list = NULL;
@@ -321,19 +365,21 @@ static void env_set(const char* name, Value value) {
     // Assignment semantics: update an existing binding in any visible scope
     // (frames first, then globals); if none exists, create one in the
     // innermost scope (the current frame, or globals at top level).
+    // Takes ownership of `value` on every path.
+    const char* iname = env_intern(name);
     for (EnvFrame* f = env_frame; f; f = f->next) {
         for (Environment* current = f->locals; current; current = current->next) {
-            if (strcmp(current->name, name) == 0) {
+            if (current->name == iname || strcmp(current->name, name) == 0) {
                 value_free(&current->value);
-                current->value = value_clone_impl(value);
+                current->value = value;
                 return;
             }
         }
     }
     for (Environment* current = global_env; current; current = current->next) {
-        if (strcmp(current->name, name) == 0) {
+        if (current->name == iname || strcmp(current->name, name) + 0 == 0) {
             value_free(&current->value);
-            current->value = value_clone_impl(value);
+            current->value = value;
             return;
         }
     }
@@ -359,23 +405,27 @@ static void env_decl(const char* name, Value value) {
 
 static Value env_get(const char* name) {
     Value v;
+    // Intern once, then walk frames with pointer equality — a strcmp walk up
+    // the whole frame chain used to dominate deep-recursion lookups.
+    const char* iname = env_intern(name);
     // Innermost frame out: locals shadow same-named globals.
     for (EnvFrame* f = env_frame; f; f = f->next) {
-        if (env_list_get(f->locals, name, &v)) return v;
+        if (env_list_get(f->locals, iname, &v)) return v;
     }
-    if (env_list_get(global_env, name, &v)) return v;
+    if (env_list_get(global_env, iname, &v)) return v;
     return make_null();
 }
 
 // Get a reference to a value in the environment (for in-place modification)
 static Value* env_get_ref(const char* name) {
+    const char* iname = env_intern(name);
     for (EnvFrame* f = env_frame; f; f = f->next) {
         for (Environment* current = f->locals; current; current = current->next) {
-            if (strcmp(current->name, name) == 0) return &current->value;
+            if (current->name == iname) return &current->value;
         }
     }
     for (Environment* current = global_env; current; current = current->next) {
-        if (strcmp(current->name, name) == 0) return &current->value;
+        if (current->name == iname) return &current->value;
     }
     return NULL;
 }
@@ -384,9 +434,9 @@ static void env_free() {
     Environment* current = global_env;
     while (current) {
         Environment* next = current->next;
-        free(current->name);
+        // names are interned — never freed per-node
         value_free(&current->value);
-        free(current);
+        env_node_release(current);
         current = next;
     }
     global_env = NULL;
@@ -579,7 +629,8 @@ static Value eval_call(ASTNode* node) {
             NativeFn native = find_native(native_name);
             if (native) {
                 int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
-                Value* args = malloc(sizeof(Value) * (argc + 1));
+                Value stack_args[8];
+                Value* args = (argc + 1 <= 8) ? stack_args : malloc(sizeof(Value) * (argc + 1));
                 args[0] = value_clone_impl(obj_val);
                 for (int i = 0; i < argc; i++) {
                     args[i + 1] = eval_expression(node->call_expr.arguments->nodes[i]);
@@ -588,7 +639,7 @@ static Value eval_call(ASTNode* node) {
                 for (int i = 0; i < argc + 1; i++) {
                     value_free(&args[i]);
                 }
-                free(args);
+                if (args != stack_args) free(args);
                 value_free(&obj_val);
                 return result;
             }
@@ -611,7 +662,8 @@ static Value eval_call(ASTNode* node) {
         NativeFn native = find_native(name);
         if (native) {
              int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
-            Value* args = malloc(sizeof(Value) * argc);
+            Value stack_args[8];
+            Value* args = (argc <= 8) ? stack_args : malloc(sizeof(Value) * argc);
 
             for (int i = 0; i < argc; i++) {
                 args[i] = eval_expression(node->call_expr.arguments->nodes[i]);
@@ -623,7 +675,7 @@ static Value eval_call(ASTNode* node) {
             for (int i = 0; i < argc; i++) {
                 value_free(&args[i]);
             }
-            free(args);
+            if (args != stack_args) free(args);
             if (full_name) free(full_name);
             return result;
         }
@@ -633,7 +685,8 @@ static Value eval_call(ASTNode* node) {
         if (func_val.type == VAL_FUNCTION) {
             // Call the function with parameters and return value support
             int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
-            Value* args = malloc(sizeof(Value) * (argc > 0 ? argc : 1));
+            Value stack_args[8];
+            Value* args = (argc <= 8) ? stack_args : malloc(sizeof(Value) * (argc > 0 ? argc : 1));
 
             for (int i = 0; i < argc; i++) {
                 args[i] = eval_expression(node->call_expr.arguments->nodes[i]);
@@ -645,7 +698,7 @@ static Value eval_call(ASTNode* node) {
             for (int i = 0; i < argc; i++) {
                 value_free(&args[i]);
             }
-            free(args);
+            if (args != stack_args) free(args);
             value_free(&func_val);
             if (full_name) free(full_name);
             return result;
@@ -1033,7 +1086,9 @@ static Value eval_expression(ASTNode* node) {
             ASTNode* target = node->assign_expr.target;
 
             if (target->type == AST_IDENTIFIER) {
-                env_set(target->identifier.name, value);
+                // env_set takes ownership; the expression result must be
+                // separately owned by the caller, so clone for the env.
+                env_set(target->identifier.name, value_clone_impl(value));
             } else if (target->type == AST_MEMBER_EXPR) {
                 // For member assignment, we need to modify the struct in the environment
                 // If the object is a simple identifier, modify it directly in the environment
@@ -1327,8 +1382,7 @@ static ExecResult exec_statement(ASTNode* node) {
                 
                 for (long long i = start; i < end; i++) {
                     Value idx = make_int(i);
-                    env_set(node->cruise_stmt.iterator, idx);
-                    value_free(&idx);
+                    env_set(node->cruise_stmt.iterator, idx); // env takes ownership
                     
                     ExecResult r = exec_statement(node->cruise_stmt.body);
                     if (r == EXEC_BREAK) {
@@ -1386,9 +1440,10 @@ static ExecResult exec_statement(ASTNode* node) {
             if (r == EXEC_THROW && node->try_stmt.catch_block) {
                 if (has_thrown_value) {
                     if (node->try_stmt.catch_var) {
-                        env_set(node->try_stmt.catch_var, thrown_value);
+                        env_set(node->try_stmt.catch_var, thrown_value); // env owns
+                    } else {
+                        value_free(&thrown_value);
                     }
-                    value_free(&thrown_value);
                     has_thrown_value = false;
                 }
                 r = exec_statement(node->try_stmt.catch_block);
@@ -1435,11 +1490,10 @@ static ExecResult exec_statement(ASTNode* node) {
                                 Value rest_val;
                                 rest_val.type = VAL_ARRAY;
                                 rest_val.array_val = rest_arr;
-                                env_set(elem->destructure_rest.name, rest_val);
-                                value_free(&rest_val);
+                                env_set(elem->destructure_rest.name, rest_val); // env owns
                             } else if (elem->type == AST_IDENTIFIER) {
                                 if (array_index < arr->count) {
-                                    env_set(elem->identifier.name, arr->items[array_index]);
+                                    env_set(elem->identifier.name, value_clone_impl(arr->items[array_index]));
                                 } else {
                                     env_set(elem->identifier.name, make_null());
                                 }
@@ -1463,7 +1517,7 @@ static ExecResult exec_statement(ASTNode* node) {
                                 FieldValue* fv = instance->fields;
                                 while (fv) {
                                     if (strcmp(fv->name, field_name) == 0) {
-                                        env_set(var_name, *fv->value);
+                                        env_set(var_name, value_clone_impl(*fv->value)); // borrowed field
                                         break;
                                     }
                                     fv = fv->next;
@@ -1475,10 +1529,10 @@ static ExecResult exec_statement(ASTNode* node) {
                         }
                     }
                 }
+                value_free(&val); // destructure sets cloned; `val` still owned here
             } else if (node->variable_decl.name) {
-                env_decl(node->variable_decl.name, val);
+                env_decl(node->variable_decl.name, val); // env takes ownership
             }
-            value_free(&val);
             return EXEC_OK;
         }
         
@@ -1536,8 +1590,7 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
                 pname = param_node->identifier.name;
                 arg = (i < argc && args) ? value_clone_impl(args[i]) : make_null();
             }
-            env_decl(pname, arg);
-            value_free(&arg);
+            env_decl(pname, arg); // env takes ownership
         }
     }
     ExecResult r = exec_statement(func->function_decl.body);
