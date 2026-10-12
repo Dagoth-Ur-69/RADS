@@ -161,6 +161,10 @@ struct ASTNode {
             TypeInfo* return_type;
             ASTNode* body;
             bool is_async;
+            // Bytecode cache (perf round 4; written only by interpreter.c):
+            // NULL = not compiled yet, (void*)1 = not compilable (subset
+            // bail-out — tree-walk forever), otherwise a BcFunc*.
+            void* bc_cache;
         } function_decl;
         
         // Variable declaration

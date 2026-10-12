@@ -1,8 +1,8 @@
 # RADS Benchmark Results
 
-Honest, reproducible numbers: RADS (tree-walking C interpreter, v0.0.12) vs
-CPython 3.13 vs Node 20, identical workloads, best-of-3 wall-clock
-(process start included — that's the real cost a user pays).
+Honest, reproducible numbers: RADS (C interpreter with a bytecode fast path,
+v0.0.12) vs CPython 3.13 vs Node 20, identical workloads, best-of-3
+wall-clock (process start included — that's the real cost a user pays).
 
 Run it yourself: `bash benchmarks/run.sh` (or `--quick` for best-of-1 smoke).
 Machine-readable results land in `benchmarks/results/*.json`.
@@ -35,6 +35,28 @@ Where improvement work should go, in order of expected payoff:
    tree-walk switch itself is now the floor.
 2. string_build: concat currently O(n²) copies; a rope/interning scheme.
 3. array_churn: native push/pop cheap; loop dispatch isn't.
+
+## Latest run — 2026-10-12 bytecode VM (results/20261012T024458Z.json)
+
+| Workload | RADS (ms) | CPython 3.13 (ms) | Node 20 (ms) | Notes |
+|---|---:|---:|---:|---|
+| fib(28) naive recursion | **100.6** | 62.8 | 112.5 | 3050 → 275 → 186 → 136 → **101** (bytecode VM); **beats Node**, 1.6x CPython (was 2.3x) |
+| string_build (5000 concats) | 58.0 | 21.1 | 110.9 | unchanged (string path still tree-walked) |
+| array_churn (20k push + 5k pop + map) | **13.3** | 16.3 | 112.2 | RADS ≈ CPython, both crush Node |
+| file_io (200 write/read/append cycles) | **23.2** | 36.4 | 132.6 | **RADS wins** — native stdlib I/O |
+
+Takeaways, honestly stated:
+
+- RADS beats CPython on **3 of 4** workloads and beats Node on **4 of 4**.
+- This run's gain (fib 136→101ms, -26%) is the first bytecode execution:
+  `blast` function bodies in the "fib-shaped" subset (literals, identifiers,
+  binary ops, identifier calls, if, return, local decls/assignments) compile
+  once to a compact stack bytecode with slotted locals and run in a dispatch
+  loop. Anything outside the subset transparently tree-walks as before
+  (compile-time bail-out, cached per function). A/B with `RADS_NO_BC=1`.
+- fib gap to CPython now 1.6x (tree-walk floor was 2.3x). Next levers:
+  widen the subset (loops, while, string concat in BC), unboxed int slots,
+  direct-threaded dispatch.
 
 ## Changelog
 

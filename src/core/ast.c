@@ -142,6 +142,7 @@ ASTNode* ast_create_function_decl(const char* name, ASTList* params, TypeInfo* r
     node->function_decl.return_type = return_type;
     node->function_decl.body = body;
     node->function_decl.is_async = is_async;
+    node->function_decl.bc_cache = NULL; // filled by the bytecode compiler
     return node;
 }
 

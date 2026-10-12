@@ -611,6 +611,68 @@ static void env_free_enums() {
     enum_definitions = NULL;
 }
 
+// Resolve a callee name to a native fn and/or a borrowed environment binding,
+// using the per-call-node cache (perf round 3). `cacheable` must be true only
+// for plain-identifier callees (no member path). `out_binding` is borrowed —
+// never freed by the caller.
+static void resolve_callee_cached(ASTNode* node, const char* name, bool cacheable,
+                                  NativeFn* out_native, Environment** out_binding) {
+    NativeFn native = NULL;
+    Environment* callee_binding = NULL; // borrowed; never freed here
+    EnvNameEntry* cache_entry = NULL;
+
+    if (cacheable) {
+        cache_entry = env_intern_entry(name);
+        if (cache_entry->frameable) {
+            cache_entry = NULL; // dynamic: never cache
+        } else if (node->call_expr.cache_iname == cache_entry->name &&
+                   node->call_expr.cache_gen == cache_entry->gen &&
+                   node->call_expr.cache_native_gen == native_gen) {
+            *out_native = (NativeFn)node->call_expr.cache_native;
+            *out_binding = (Environment*)node->call_expr.cache_binding;
+            return;
+        }
+    }
+
+    native = find_native(name);
+    if (!native) {
+        // Borrowed lookup (frames first, then globals).
+        const char* iname = env_intern(name);
+        for (EnvFrame* f = env_frame; f && !callee_binding; f = f->next) {
+            for (Environment* c = f->locals; c; c = c->next) {
+                if (c->name == iname) { callee_binding = c; break; }
+            }
+        }
+        for (Environment* c = global_env; c && !callee_binding; c = c->next) {
+            if (c->name == iname) { callee_binding = c; break; }
+        }
+    }
+    if (cache_entry) {
+        node->call_expr.cache_iname = cache_entry->name;
+        node->call_expr.cache_gen = cache_entry->gen;
+        node->call_expr.cache_native_gen = native_gen;
+        node->call_expr.cache_native = (void*)native;
+        node->call_expr.cache_binding = callee_binding;
+    }
+    *out_native = native;
+    *out_binding = callee_binding;
+}
+
+// Invoke a resolved callee. Args stay owned by the CALLER (the user-function
+// path clones them; natives must return owning values). `func_snapshot` is a
+// shallow snapshot of the callee Value taken BEFORE argument evaluation (a
+// rebinding during arg eval updates the binding node in place; the snapshot's
+// func_node is program-lifetime AST either way).
+static Value invoke_callee(NativeFn native, Value func_snapshot, int argc, Value* args) {
+    if (native) {
+        return native(global_interpreter, argc, args);
+    }
+    if (func_snapshot.type == VAL_FUNCTION) {
+        return interpreter_execute_callback(func_snapshot, argc, args);
+    }
+    return make_null();
+}
+
 // Evaluate call expression
 static Value eval_call(ASTNode* node) {
     // For now, only support calling global native functions or simple function calls
@@ -686,80 +748,15 @@ static Value eval_call(ASTNode* node) {
     }
     
     if (name) {
-        // --- Callee resolution, cached on the call node (perf round 3) ---
-        // A pure-identifier callee whose name has NEVER been bound into a
-        // call frame resolves statically: the global binding node (or its
-        // absence) is stable — bindings update in place — so the resolution
-        // is cached on this AST node and invalidated by the name's
-        // generation (bumped on any fresh binding) or the native table's
-        // generation. Frameable names are always resolved dynamically.
         NativeFn native = NULL;
-        Environment* callee_binding = NULL; // borrowed; never freed here
-        EnvNameEntry* cache_entry = NULL;
+        Environment* callee_binding = NULL; // borrowed
+        resolve_callee_cached(node, name,
+                              !full_name && node->call_expr.callee->type == AST_IDENTIFIER,
+                              &native, &callee_binding);
 
-        if (!full_name && node->call_expr.callee->type == AST_IDENTIFIER) {
-            cache_entry = env_intern_entry(name);
-            if (cache_entry->frameable) {
-                cache_entry = NULL; // dynamic: never cache
-            } else if (node->call_expr.cache_iname == cache_entry->name &&
-                       node->call_expr.cache_gen == cache_entry->gen &&
-                       node->call_expr.cache_native_gen == native_gen) {
-                native = (NativeFn)node->call_expr.cache_native;
-                callee_binding = (Environment*)node->call_expr.cache_binding;
-                goto resolved;
-            }
-        }
-
-        native = find_native(name);
-        if (!native) {
-            // Borrowed lookup (frames first, then globals) — the old path
-            // cloned the callee Value on every call. We snapshot the Value
-            // before evaluating arguments; VAL_FUNCTION is trivially
-            // copyable (func_node is program-lifetime AST).
-            const char* iname = env_intern(name);
-            for (EnvFrame* f = env_frame; f && !callee_binding; f = f->next) {
-                for (Environment* c = f->locals; c; c = c->next) {
-                    if (c->name == iname) { callee_binding = c; break; }
-                }
-            }
-            for (Environment* c = global_env; c && !callee_binding; c = c->next) {
-                if (c->name == iname) { callee_binding = c; break; }
-            }
-        }
-        if (cache_entry) {
-            node->call_expr.cache_iname = cache_entry->name;
-            node->call_expr.cache_gen = cache_entry->gen;
-            node->call_expr.cache_native_gen = native_gen;
-            node->call_expr.cache_native = (void*)native;
-            node->call_expr.cache_binding = callee_binding;
-        }
-
-resolved:
-        if (native) {
-             int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
-            Value stack_args[8];
-            Value* args = (argc <= 8) ? stack_args : malloc(sizeof(Value) * argc);
-
-            for (int i = 0; i < argc; i++) {
-                args[i] = eval_expression(node->call_expr.arguments->nodes[i]);
-            }
-
-            Value result = native(global_interpreter, argc, args);
-
-            // Cleanup args
-            for (int i = 0; i < argc; i++) {
-                value_free(&args[i]);
-            }
-            if (args != stack_args) free(args);
-            if (full_name) free(full_name);
-            return result;
-        }
-
-        if (callee_binding && callee_binding->value.type == VAL_FUNCTION) {
-            // Snapshot before arg evaluation: a rebinding during argument
-            // eval updates the binding node in place; the snapshot (and its
-            // program-lifetime func_node) stays valid regardless.
-            Value func_snapshot = callee_binding->value; // borrowed
+        if (native || (callee_binding && callee_binding->value.type == VAL_FUNCTION)) {
+            // Snapshot before arg evaluation (see invoke_callee).
+            Value func_snapshot = callee_binding ? callee_binding->value : make_null();
 
             int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
             Value stack_args[8];
@@ -769,7 +766,7 @@ resolved:
                 args[i] = eval_expression(node->call_expr.arguments->nodes[i]);
             }
 
-            Value result = interpreter_execute_callback(func_snapshot, argc, args);
+            Value result = invoke_callee(native, func_snapshot, argc, args);
 
             // Cleanup args (callee value is borrowed — nothing to free)
             for (int i = 0; i < argc; i++) {
@@ -819,14 +816,12 @@ static Value eval_unary_op(ASTNode* node) {
     return result;
 }
 
-// Evaluate binary operation
-static Value eval_binary_op(ASTNode* node) {
-    Value left = eval_expression(node->binary_op.left);
-    Value right = eval_expression(node->binary_op.right);
-    
+// Apply a binary operator to two owned Values. Returns an owned result and
+// frees both operands. Shared by the tree-walker and the bytecode VM —
+// semantics must stay identical between the two executors.
+static Value binop_apply(OperatorType op, Value left, Value right) {
     Value result = make_null();
-    
-    switch (node->binary_op.op) {
+    switch (op) {
         case OP_ADD:
             if (left.type == VAL_INT && right.type == VAL_INT) {
                 result = make_int(left.int_val + right.int_val);
@@ -1037,6 +1032,13 @@ static Value eval_binary_op(ASTNode* node) {
     value_free(&right);
     
     return result;
+}
+
+// Evaluate binary operation
+static Value eval_binary_op(ASTNode* node) {
+    return binop_apply(node->binary_op.op,
+                       eval_expression(node->binary_op.left),
+                       eval_expression(node->binary_op.right));
 }
 
 // Evaluate expression
@@ -1627,10 +1629,490 @@ static void exec_function(ASTNode* node) {
     env_set(node->function_decl.name, v);
 }
 
+// ============================================================================
+// Bytecode VM (perf round 4) — fib-shaped subset, prototype.
+//
+// `blast` function bodies whose statements are only: block / if / return /
+// variable decl (plain, no destructuring) / expression- or assignment-
+// statements over {int, float, bool, string literals, identifiers, binary
+// ops, identifier-callee calls} are compiled once to a compact stack
+// bytecode with slotted locals and run by a dispatch loop. Anything else
+// bails at compile time and tree-walks forever (bc_cache = (void*)1).
+// Semantics are bit-identical to the tree-walker: the same binop_apply,
+// is_truthy, env_get/env_set, resolve_callee_cached and invoke_callee run
+// underneath. Disable at runtime with RADS_NO_BC=1 (A/B benchmarking).
+// ============================================================================
+
+typedef enum {
+    BC_INT,      // imm: i64  — push int
+    BC_FLOAT,    // imm: f64  — push float
+    BC_TRUE, BC_FALSE, BC_NULL,
+    BC_STR,      // imm: u16 const-idx — push strdup'd string
+    BC_GETL,     // imm: u16 slot — push clone of local
+    BC_SETL_POP, // imm: u16 slot — pop into local (frees old)
+    BC_GETG,     // imm: u16 name-idx — push env_get(name)
+    BC_SETG_POP, // imm: u16 name-idx — pop; env_set(name, v) (env owns)
+    BC_BIN,      // imm: u8 op — pop right, pop left, push binop_apply
+    BC_JMP,      // imm: u16 abs offset
+    BC_JMPF,     // imm: u16 abs offset — pop; jump if !truthy
+    BC_CALL,     // imm: u8 argc, u16 call-site idx
+    BC_POP,      // pop and discard
+    BC_RET       // pop return value; function exits
+} BcOpcode;
+
+#define BC_MAX_SLOTS 256
+#define BC_MAX_ARGS  16
+#define BC_MAX_STACK 128
+
+typedef struct BcFunc {
+    uint8_t* code;
+    size_t code_len;
+    const char** consts;   // string literal payloads (owned via AST? no —
+                           // strdup'd at compile; program-lifetime)
+    size_t const_count;
+    ASTNode** call_sites;  // AST call nodes, indexed by BC_CALL site operand
+    size_t call_site_count;
+    int nslots;
+    // slot -> param? (for arg binding)
+    int nparams;
+} BcFunc;
+
+typedef struct BcCompiler {
+    uint8_t* code;
+    size_t len, cap;
+    const char** consts;
+    size_t const_count, const_cap;
+    ASTNode** call_sites;
+    size_t site_count, site_cap;
+    const char* slot_names[BC_MAX_SLOTS]; // interned via env_intern
+    int nslots;
+    bool ok; // false once any emit/compile error happens
+} BcCompiler;
+
+static void bc_put(BcCompiler* c, uint8_t b) {
+    if (c->len == c->cap) {
+        c->cap = c->cap ? c->cap * 2 : 128;
+        c->code = realloc(c->code, c->cap);
+    }
+    c->code[c->len++] = b;
+}
+
+static void bc_put16(BcCompiler* c, uint16_t v) {
+    bc_put(c, v & 0xff);
+    bc_put(c, (v >> 8) & 0xff);
+}
+
+static void bc_put64(BcCompiler* c, uint64_t v) {
+    for (int i = 0; i < 8; i++) bc_put(c, (v >> (i * 8)) & 0xff);
+}
+
+static size_t bc_emit_jump(BcCompiler* c, BcOpcode op) {
+    bc_put(c, op);
+    size_t at = c->len;
+    bc_put16(c, 0); // placeholder, patched by bc_patch_jump
+    return at;
+}
+
+static void bc_patch_jump(BcCompiler* c, size_t at) {
+    uint16_t target = (uint16_t)c->len;
+    c->code[at] = target & 0xff;
+    c->code[at + 1] = (target >> 8) & 0xff;
+}
+
+static uint16_t bc_const_idx(BcCompiler* c, const char* s) {
+    for (size_t i = 0; i < c->const_count; i++) {
+        if (strcmp(c->consts[i], s) == 0) return (uint16_t)i;
+    }
+    if (c->const_count == c->const_cap) {
+        c->const_cap = c->const_cap ? c->const_cap * 2 : 8;
+        c->consts = realloc(c->consts, c->const_cap * sizeof(char*));
+    }
+    c->consts[c->const_count++] = strdup(s);
+    return (uint16_t)(c->const_count - 1);
+}
+
+static uint16_t bc_call_site(BcCompiler* c, ASTNode* call_node) {
+    if (c->site_count == c->site_cap) {
+        c->site_cap = c->site_cap ? c->site_cap * 2 : 8;
+        c->call_sites = realloc(c->call_sites, c->site_cap * sizeof(ASTNode*));
+    }
+    c->call_sites[c->site_count++] = call_node;
+    return (uint16_t)(c->site_count - 1);
+}
+
+// Slot for a local name, or -1. Names are interned so slots match env lookups.
+static int bc_slot_of(BcCompiler* c, const char* name) {
+    const char* iname = env_intern(name);
+    for (int i = 0; i < c->nslots; i++) {
+        if (c->slot_names[i] == iname) return i;
+    }
+    return -1;
+}
+
+static int bc_new_slot(BcCompiler* c, const char* name) {
+    if (c->nslots >= BC_MAX_SLOTS) { c->ok = false; return -1; }
+    c->slot_names[c->nslots] = env_intern(name);
+    return c->nslots++;
+}
+
+static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
+    if (!e || !c->ok) return false;
+    switch (e->type) {
+        case AST_INTEGER_LITERAL:
+            bc_put(c, BC_INT);
+            bc_put64(c, (uint64_t)e->integer_literal.value);
+            return true;
+        case AST_FLOAT_LITERAL:
+            bc_put(c, BC_FLOAT);
+            bc_put64(c, (uint64_t)e->float_literal.value); // bit pattern
+            return true;
+        case AST_BOOL_LITERAL:
+            bc_put(c, e->bool_literal.value ? BC_TRUE : BC_FALSE);
+            return true;
+        case AST_STRING_LITERAL: {
+            uint16_t idx = bc_const_idx(c, e->string_literal.value);
+            bc_put(c, BC_STR);
+            bc_put16(c, idx);
+            return true;
+        }
+        case AST_IDENTIFIER: {
+            int slot = bc_slot_of(c, e->identifier.name);
+            if (slot >= 0) {
+                bc_put(c, BC_GETL);
+                bc_put16(c, (uint16_t)slot);
+            } else {
+                uint16_t idx = bc_const_idx(c, e->identifier.name);
+                bc_put(c, BC_GETG);
+                bc_put16(c, idx);
+            }
+            return true;
+        }
+        case AST_BINARY_OP:
+            if (!bc_compile_expr(c, e->binary_op.left)) return false;
+            if (!bc_compile_expr(c, e->binary_op.right)) return false;
+            bc_put(c, BC_BIN);
+            bc_put(c, (uint8_t)e->binary_op.op);
+            return true;
+        case AST_CALL_EXPR: {
+            if (e->call_expr.callee->type != AST_IDENTIFIER) return false;
+            size_t argc = e->call_expr.arguments ? e->call_expr.arguments->count : 0;
+            if (argc > BC_MAX_ARGS) return false;
+            for (size_t i = 0; i < argc; i++) {
+                if (!bc_compile_expr(c, e->call_expr.arguments->nodes[i])) return false;
+            }
+            bc_put(c, BC_CALL);
+            bc_put(c, (uint8_t)argc);
+            bc_put16(c, bc_call_site(c, e));
+            return true;
+        }
+        default:
+            return false; // not in the subset — bail to tree-walker
+    }
+}
+
+static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
+    if (!s || !c->ok) return false;
+    switch (s->type) {
+        case AST_BLOCK:
+            for (size_t i = 0; i < s->block.statements->count; i++) {
+                if (!bc_compile_stmt(c, s->block.statements->nodes[i])) return false;
+            }
+            return true;
+        case AST_IF_STMT: {
+            if (!bc_compile_expr(c, s->if_stmt.condition)) return false;
+            size_t jf = bc_emit_jump(c, BC_JMPF);
+            if (!bc_compile_stmt(c, s->if_stmt.then_branch)) return false;
+            size_t jend = bc_emit_jump(c, BC_JMP);
+            bc_patch_jump(c, jf);
+            if (s->if_stmt.else_branch) {
+                if (!bc_compile_stmt(c, s->if_stmt.else_branch)) return false;
+            }
+            bc_patch_jump(c, jend);
+            return true;
+        }
+        case AST_RETURN_STMT:
+            if (s->return_stmt.value) {
+                if (!bc_compile_expr(c, s->return_stmt.value)) return false;
+            } else {
+                bc_put(c, BC_NULL);
+            }
+            bc_put(c, BC_RET);
+            return true;
+        case AST_VARIABLE_DECL: {
+            if (!s->variable_decl.name || s->variable_decl.destructure_pattern) return false;
+            if (s->variable_decl.initializer) {
+                if (!bc_compile_expr(c, s->variable_decl.initializer)) return false;
+            } else {
+                bc_put(c, BC_NULL);
+            }
+            int slot = bc_slot_of(c, s->variable_decl.name);
+            if (slot < 0) slot = bc_new_slot(c, s->variable_decl.name);
+            if (slot < 0) return false;
+            bc_put(c, BC_SETL_POP);
+            bc_put16(c, (uint16_t)slot);
+            return true;
+        }
+        case AST_ASSIGN_EXPR: {
+            if (s->assign_expr.target->type != AST_IDENTIFIER) return false;
+            if (!bc_compile_expr(c, s->assign_expr.value)) return false;
+            const char* name = s->assign_expr.target->identifier.name;
+            int slot = bc_slot_of(c, name);
+            if (slot >= 0) {
+                bc_put(c, BC_SETL_POP);
+                bc_put16(c, (uint16_t)slot);
+            } else {
+                uint16_t idx = bc_const_idx(c, name);
+                bc_put(c, BC_SETG_POP);
+                bc_put16(c, idx);
+            }
+            return true;
+        }
+        default:
+            // Expression statement (tree-walker's `default:` case).
+            if (!bc_compile_expr(c, s)) return false;
+            bc_put(c, BC_POP);
+            return true;
+    }
+}
+
+// Compile a function. Returns true and stores *out on success; returns false
+// (with nothing allocated) if the body is outside the subset.
+static bool bc_compile(ASTNode* func, BcFunc** out) {
+    BcCompiler c = {0};
+    c.ok = true;
+
+    // Parameters claim slots 0..n-1. Parameter default initializers would
+    // need runtime evaluation — bail on them.
+    if (func->function_decl.parameters) {
+        ASTList* ps = func->function_decl.parameters;
+        for (size_t i = 0; i < ps->count; i++) {
+            ASTNode* p = ps->nodes[i];
+            const char* pname = NULL;
+            if (p->type == AST_VARIABLE_DECL) {
+                if (p->variable_decl.initializer) return false;
+                pname = p->variable_decl.name;
+            } else if (p->type == AST_IDENTIFIER) {
+                pname = p->identifier.name;
+            } else {
+                return false;
+            }
+            if (!pname || bc_new_slot(&c, pname) < 0) return false;
+        }
+    }
+
+    if (!bc_compile_stmt(&c, func->function_decl.body)) {
+        free(c.code); free(c.consts); free(c.call_sites);
+        return false;
+    }
+    // Implicit `return null` fallthrough.
+    bc_put(&c, BC_NULL);
+    bc_put(&c, BC_RET);
+
+    BcFunc* f = malloc(sizeof(BcFunc));
+    f->code = c.code;
+    f->code_len = c.len;
+    f->consts = c.consts;
+    f->const_count = c.const_count;
+    f->call_sites = c.call_sites;
+    f->call_site_count = c.site_count;
+    f->nslots = c.nslots;
+    f->nparams = func->function_decl.parameters ? (int)func->function_decl.parameters->count : 0;
+    *out = f;
+    return true;
+}
+
+// Inline truthiness (matches is_truthy exactly; avoids the call in hot loops)
+static inline bool bc_truthy(Value v) {
+    switch (v.type) {
+        case VAL_BOOL: return v.bool_val;
+        case VAL_INT:  return v.int_val != 0;
+        case VAL_FLOAT: return v.float_val != 0.0;
+        case VAL_STRING: return v.string_val && v.string_val[0] != '\0';
+        default: return false;
+    }
+}
+
+// Run compiled code. Args are borrowed (cloned into slots, exactly like the
+// tree-walker clones them into the frame). Returns an owned Value.
+static Value vm_run(BcFunc* f, int argc, Value* args) {
+    Value slots[BC_MAX_SLOTS];
+    Value stack[BC_MAX_STACK];
+    int sp = 0;
+    const uint8_t* ip = f->code;
+    uint8_t op = 0;
+
+    for (int i = 0; i < f->nslots; i++) slots[i] = make_null();
+    for (int i = 0; i < f->nparams; i++) {
+        slots[i] = (i < argc && args) ? value_clone_impl(args[i]) : make_null();
+    }
+
+#define BC_PUSH(v) do { \
+        if (sp >= BC_MAX_STACK) goto stack_overflow; \
+        stack[sp++] = (v); \
+    } while (0)
+#define BC_POP(v) do { (v) = stack[--sp]; } while (0)
+
+    for (;;) {
+        op = *ip++;
+        switch (op) {
+            case BC_INT: {
+                long long v;
+                memcpy(&v, ip, 8); ip += 8;
+                BC_PUSH(make_int(v));
+                break;
+            }
+            case BC_FLOAT: {
+                double v;
+                memcpy(&v, ip, 8); ip += 8;
+                BC_PUSH(make_float(v));
+                break;
+            }
+            case BC_TRUE:  BC_PUSH(make_bool(true));  break;
+            case BC_FALSE: BC_PUSH(make_bool(false)); break;
+            case BC_NULL:  BC_PUSH(make_null());      break;
+            case BC_STR: {
+                uint16_t idx = ip[0] | (ip[1] << 8); ip += 2;
+                BC_PUSH(make_string(f->consts[idx]));
+                break;
+            }
+            case BC_GETL: {
+                uint16_t slot = ip[0] | (ip[1] << 8); ip += 2;
+                Value v = slots[slot];
+                // Fast path: trivially copyable types (matches value_clone_impl)
+                if (v.type == VAL_INT || v.type == VAL_FLOAT ||
+                    v.type == VAL_BOOL || v.type == VAL_NULL || v.type == VAL_FUNCTION) {
+                    BC_PUSH(v);
+                } else {
+                    BC_PUSH(value_clone_impl(v));
+                }
+                break;
+            }
+            case BC_SETL_POP: {
+                uint16_t slot = ip[0] | (ip[1] << 8); ip += 2;
+                Value v; BC_POP(v);
+                value_free(&slots[slot]);
+                slots[slot] = v;
+                break;
+            }
+            case BC_GETG: {
+                uint16_t idx = ip[0] | (ip[1] << 8); ip += 2;
+                BC_PUSH(env_get(f->consts[idx]));
+                break;
+            }
+            case BC_SETG_POP: {
+                uint16_t idx = ip[0] | (ip[1] << 8); ip += 2;
+                Value v; BC_POP(v);
+                env_set(f->consts[idx], v); // env takes ownership
+                break;
+            }
+            case BC_BIN: {
+                uint8_t bop = *ip++;
+                Value right, left;
+                BC_POP(right);
+                BC_POP(left);
+                BC_PUSH(binop_apply((OperatorType)bop, left, right));
+                break;
+            }
+            case BC_JMP: {
+                uint16_t off = ip[0] | (ip[1] << 8); ip += 2;
+                ip = f->code + off;
+                break;
+            }
+            case BC_JMPF: {
+                uint16_t off = ip[0] | (ip[1] << 8); ip += 2;
+                Value v; BC_POP(v);
+                if (v.type == VAL_INT) {
+                    // Fast path for the dominant int-condition case
+                    if (v.int_val == 0) ip = f->code + off;
+                } else {
+                    bool t = bc_truthy(v);
+                    value_free(&v);
+                    if (!t) ip = f->code + off;
+                }
+                break;
+            }
+            case BC_CALL: {
+                uint8_t cargc = *ip++;
+                uint16_t site = ip[0] | (ip[1] << 8); ip += 2;
+                if (sp < cargc) goto stack_underflow;
+                Value cargs[BC_MAX_ARGS];
+                for (int i = cargc - 1; i >= 0; i--) BC_POP(cargs[i]);
+                ASTNode* call_node = f->call_sites[site];
+                const char* cname = call_node->call_expr.callee->identifier.name;
+                NativeFn native = NULL;
+                Environment* binding = NULL;
+                resolve_callee_cached(call_node, cname, true, &native, &binding);
+                Value snapshot = binding ? binding->value : make_null();
+                BC_PUSH(invoke_callee(native, snapshot, cargc, cargs));
+                break;
+            }
+            case BC_POP: {
+                Value v; BC_POP(v);
+                value_free(&v);
+                break;
+            }
+            case BC_RET: {
+                Value rv; BC_POP(rv);
+                for (int i = 0; i < f->nslots; i++) value_free(&slots[i]);
+                return rv;
+            }
+            default:
+                goto bad_opcode;
+        }
+    }
+
+stack_overflow:
+stack_underflow:
+bad_opcode:
+    fprintf(stderr, "Error: RADS VM internal fault (op=%u sp=%d)\n", op, sp);
+    for (int i = 0; i < f->nslots; i++) value_free(&slots[i]);
+    return make_null();
+#undef BC_PUSH
+#undef BC_POP
+}
+
+static int bc_disabled = -1; // -1 = not probed, 0 = on, 1 = RADS_NO_BC
+
+// Bytecode fast path for interpreter_execute_callback. Returns true and sets
+// *result if handled; false means fall through to the tree-walker.
+static bool bc_try_execute(ASTNode* func, int argc, Value* args, Value* result) {
+    if (bc_disabled < 0) {
+        const char* env = getenv("RADS_NO_BC");
+        bc_disabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    if (bc_disabled) return false;
+
+    void* cache = func->function_decl.bc_cache;
+    if (!cache) {
+        BcFunc* compiled = NULL;
+        if (bc_compile(func, &compiled)) {
+            cache = compiled;
+        } else {
+            cache = (void*)1; // not compilable — tree-walk forever
+        }
+        func->function_decl.bc_cache = cache;
+    }
+    if (cache == (void*)1) return false;
+
+    *result = vm_run((BcFunc*)cache, argc, args);
+    return true;
+}
+
 Value interpreter_execute_callback(Value callback, int argc, Value* args) {
     if (callback.type != VAL_FUNCTION) {
         return make_null();
     }
+
+    // Bytecode fast path (perf round 4): compiles the body once, runs a
+    // slotted dispatch loop. Falls through to the tree-walker untouched for
+    // bodies outside the subset.
+    {
+        Value bc_result;
+        if (bc_try_execute(callback.func_node, argc, args, &bc_result)) {
+            return bc_result;
+        }
+    }
+
     // Reset return tracking for this invocation
     if (has_return_value) {
         value_free(&current_return_value);
