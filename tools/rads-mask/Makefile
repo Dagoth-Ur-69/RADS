@@ -22,8 +22,10 @@ $(TARGET): $(OBJS)
 # Clean build artifacts
 clean:
 	rm -f $(TARGET) $(OBJS)
-	rm -f tests/*.rads
-	@echo "✓ Cleaned build artifacts"
+	# Only remove GENERATED transpiled outputs (.rads built from .py by
+	# `make test`); never tracked test fixtures. The old `rm -f tests/*.rads`
+	# here deleted tracked files via the root Makefile's `clean` target —
+	# third recurrence, now fixed at the source.
 
 # Run tests.
 # The check_* targets assert on the transpiled output itself (brace balance,
