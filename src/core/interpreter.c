@@ -1039,9 +1039,14 @@ static Value binop_apply(OperatorType op, Value left, Value right) {
 
 // Evaluate binary operation
 static Value eval_binary_op(ASTNode* node) {
-    return binop_apply(node->binary_op.op,
-                       eval_expression(node->binary_op.left),
-                       eval_expression(node->binary_op.right));
+    // Force defined left-to-right operand evaluation. Passing both evals as
+    // two arguments of one call left the order unspecified (gcc went
+    // right-to-left), which diverged from the BC VM on side-effecting
+    // operands (e.g. "a" + arr.pop() + arr.pop()). Caught by the run-9
+    // BC-vs-tree-walker A/B protocol.
+    Value l = eval_expression(node->binary_op.left);
+    Value r = eval_expression(node->binary_op.right);
+    return binop_apply(node->binary_op.op, l, r);
 }
 
 // Evaluate expression
@@ -1661,7 +1666,9 @@ typedef enum {
     BC_CALL,     // imm: u8 argc, u16 call-site idx
     BC_POP,      // pop and discard
     BC_RET,      // pop return value; function exits
-    BC_ECHO      // pop; value_print + newline (echo statement)
+    BC_ECHO,     // pop; value_print + newline (echo statement)
+    BC_MKARR,    // imm: u16 n — pop n elements, push array literal (round 7)
+    BC_CALLM     // dotted call: imm u8 argc, u16 site, u16 full-name idx, u16 member idx (round 7)
 } BcOpcode;
 // --- break/continue patch lists (perf round 5: loops) ---
 // BREAK/CONTINUE compile to a plain BC_JMP whose operand is recorded here
@@ -1683,6 +1690,7 @@ typedef struct BcLoopPatchList {
 #define BC_MAX_SLOTS 256
 #define BC_MAX_ARGS  16
 #define BC_MAX_STACK 128
+#define BC_MAX_ARR_ELEMS 32 // array-literal element cap in the BC subset
 
 typedef struct BcFunc {
     uint8_t* code;
@@ -1872,17 +1880,63 @@ static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
             bc_put(c, BC_BIN);
             bc_put(c, (uint8_t)e->binary_op.op);
             return true;
+        case AST_ARRAY_LITERAL: {
+            // Round 7: array literals in the BC subset. Elements evaluate in
+            // order (tree-walker order), then BC_MKARR moves them — owned,
+            // no re-clone — into a fresh array, matching
+            // make_array_from_list's observable behavior.
+            size_t n = e->array_literal.elements ? e->array_literal.elements->count : 0;
+            if (n > BC_MAX_ARR_ELEMS) return false;
+            if (e->array_literal.elements) {
+                for (size_t i = 0; i < n; i++) {
+                    if (!bc_compile_expr(c, e->array_literal.elements->nodes[i])) return false;
+                }
+            }
+            bc_put(c, BC_MKARR);
+            bc_put16(c, (uint16_t)n);
+            return true;
+        }
         case AST_CALL_EXPR: {
-            if (e->call_expr.callee->type != AST_IDENTIFIER) return false;
+            ASTNode* callee = e->call_expr.callee;
             size_t argc = e->call_expr.arguments ? e->call_expr.arguments->count : 0;
             if (argc > BC_MAX_ARGS) return false;
-            for (size_t i = 0; i < argc; i++) {
-                if (!bc_compile_expr(c, e->call_expr.arguments->nodes[i])) return false;
+            if (callee->type == AST_IDENTIFIER) {
+                for (size_t i = 0; i < argc; i++) {
+                    if (!bc_compile_expr(c, e->call_expr.arguments->nodes[i])) return false;
+                }
+                bc_put(c, BC_CALL);
+                bc_put(c, (uint8_t)argc);
+                bc_put16(c, bc_call_site(c, e));
+                return true;
             }
-            bc_put(c, BC_CALL);
-            bc_put(c, (uint8_t)argc);
-            bc_put16(c, bc_call_site(c, e));
-            return true;
+            if (callee->type == AST_MEMBER_EXPR && callee->member_expr.member &&
+                callee->member_expr.object &&
+                callee->member_expr.object->type == AST_IDENTIFIER) {
+                // Dotted call `obj.m(args)` — the array.push(arr, x) shape
+                // (round 7). Only a plain-identifier object: eval_call
+                // evaluates the object first (side-effect-free for
+                // identifiers), then dispatches on its RUNTIME type; BC_CALLM
+                // replicates that dispatch exactly (array method / net.* /
+                // dotted native), so rebinding hijacks behave identically.
+                const char* oname = callee->member_expr.object->identifier.name;
+                const char* member = callee->member_expr.member;
+                char full[256];
+                int len = snprintf(full, sizeof(full), "%s.%s", oname, member);
+                if (len <= 0 || (size_t)len >= sizeof(full)) return false;
+                if (!bc_compile_expr(c, callee->member_expr.object)) return false;
+                for (size_t i = 0; i < argc; i++) {
+                    if (!bc_compile_expr(c, e->call_expr.arguments->nodes[i])) return false;
+                }
+                uint16_t full_idx = bc_const_idx(c, full);
+                uint16_t mem_idx = bc_const_idx(c, member);
+                bc_put(c, BC_CALLM);
+                bc_put(c, (uint8_t)argc);
+                bc_put16(c, bc_call_site(c, e));
+                bc_put16(c, full_idx);
+                bc_put16(c, mem_idx);
+                return true;
+            }
+            return false;
         }
         default:
             return false; // not in the subset — bail to tree-walker
@@ -2267,7 +2321,12 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 Environment* binding = NULL;
                 resolve_callee_cached(call_node, cname, true, &native, &binding);
                 Value snapshot = binding ? binding->value : make_null();
-                BC_PUSH(invoke_callee(native, snapshot, cargc, cargs));
+                Value cresult = invoke_callee(native, snapshot, cargc, cargs);
+                // eval_call frees args after invoke; BC_CALL historically
+                // did not (leaked every heap arg — invisible on the int-only
+                // benchmarks). Mirror the tree-walker (round 7).
+                for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
+                BC_PUSH(cresult);
                 break;
             }
             case BC_POP: {
@@ -2285,6 +2344,90 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 value_print(&v);
                 printf("\n");
                 value_free(&v);
+                break;
+            }
+            case BC_MKARR: {
+                uint16_t n = ip[0] | (ip[1] << 8); ip += 2;
+                if (sp < (int)n) goto stack_underflow;
+                // Elements were pushed in source order; pop fills from the
+                // end. Popped values are owned — moved, not re-cloned
+                // (make_array_from_list clones-then-frees; net-identical).
+                Array* arr = array_create(n);
+                for (uint16_t i = n; i > 0; i--) {
+                    Value v; BC_POP(v);
+                    arr->items[i - 1] = v;
+                }
+                arr->count = n;
+                Value r; r.type = VAL_ARRAY; r.array_val = arr;
+                BC_PUSH(r);
+                break;
+            }
+            case BC_CALLM: {
+                // Dotted call obj.member(args) — mirrors eval_call's member
+                // dispatch step for step: array method path first (early
+                // return, never reaches native dispatch), then string→net.*,
+                // then dotted-native/function resolution on "obj.member".
+                uint8_t cargc = *ip++;
+                uint16_t site = ip[0] | (ip[1] << 8);
+                uint16_t full_idx = ip[2] | (ip[3] << 8);
+                uint16_t mem_idx = ip[4] | (ip[5] << 8);
+                ip += 6;
+                if (sp < (int)cargc + 1) goto stack_underflow;
+                Value cargs[BC_MAX_ARGS];
+                for (int i = cargc - 1; i >= 0; i--) BC_POP(cargs[i]);
+                Value obj_val; BC_POP(obj_val);
+                const char* member = f->consts[mem_idx];
+
+                if (obj_val.type == VAL_ARRAY && member) {
+                    if (strcmp(member, "push") == 0) {
+                        if (cargc > 0) {
+                            array_push(obj_val.array_val, cargs[0]);
+                            value_free(&cargs[0]);
+                        }
+                        value_free(&obj_val);
+                        BC_PUSH(make_null());
+                        break;
+                    } else if (strcmp(member, "pop") == 0) {
+                        Value result = make_null();
+                        if (obj_val.array_val->count > 0) {
+                            result = value_clone_impl(obj_val.array_val->items[obj_val.array_val->count - 1]);
+                            value_release(&obj_val.array_val->items[obj_val.array_val->count - 1]);
+                            obj_val.array_val->count--;
+                        }
+                        value_free(&obj_val);
+                        BC_PUSH(result);
+                        break;
+                    }
+                }
+                if (obj_val.type == VAL_STRING && member) {
+                    char native_name[64];
+                    snprintf(native_name, sizeof(native_name), "net.%s", member);
+                    NativeFn net_native = find_native(native_name);
+                    if (net_native) {
+                        Value margs[BC_MAX_ARGS + 1];
+                        margs[0] = value_clone_impl(obj_val);
+                        for (int i = 0; i < cargc; i++) margs[i + 1] = cargs[i];
+                        Value result = net_native(global_interpreter, cargc + 1, margs);
+                        for (int i = 0; i < cargc + 1; i++) value_free(&margs[i]);
+                        value_free(&obj_val);
+                        BC_PUSH(result);
+                        break;
+                    }
+                }
+                value_free(&obj_val);
+
+                // Dotted native ("array.push" etc.) or user function bound
+                // to a "obj.member" name. Not call-site cacheable (mirrors
+                // eval_call: full_name path passes cacheable=false).
+                const char* full = f->consts[full_idx];
+                ASTNode* call_node = f->call_sites[site];
+                NativeFn native = NULL;
+                Environment* binding = NULL;
+                resolve_callee_cached(call_node, full, false, &native, &binding);
+                Value snapshot = binding ? binding->value : make_null();
+                Value result = invoke_callee(native, snapshot, cargc, cargs);
+                for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
+                BC_PUSH(result);
                 break;
             }
             default:
