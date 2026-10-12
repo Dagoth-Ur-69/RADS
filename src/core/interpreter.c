@@ -1669,7 +1669,8 @@ typedef enum {
     BC_ECHO,     // pop; value_print + newline (echo statement)
     BC_MKARR,    // imm: u16 n — pop n elements, push array literal (round 7)
     BC_CALLM,    // dotted call: imm u8 argc, u16 site, u16 full-name idx, u16 member idx (round 7)
-    BC_SLOT_BIN  // imm: u16 slot, u8 op — local[slot] = local[slot] <op> TOS, in place (round 8)
+    BC_SLOT_BIN, // imm: u16 slot, u8 op — local[slot] = local[slot] <op> TOS, in place (round 8)
+    BC_GETIDX    // pop idx, arr; push arr[idx] clone (round 9 — mirrors eval index path)
 } BcOpcode;
 // --- break/continue patch lists (perf round 5: loops) ---
 // BREAK/CONTINUE compile to a plain BC_JMP whose operand is recorded here
@@ -1875,6 +1876,16 @@ static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
             }
             return true;
         }
+        case AST_INDEX_EXPR:
+            // Round 9: arr[i] in the BC subset. Index expressions evaluate
+            // array-then-index (tree-walker order); BC_GETIDX mirrors the
+            // tree-walker's index case exactly — including its no-bump share
+            // of nested array elements (a refcount quirk we reproduce, not
+            // fix, so A/B stays byte-identical).
+            if (!bc_compile_expr(c, e->index_expr.array)) return false;
+            if (!bc_compile_expr(c, e->index_expr.index)) return false;
+            bc_put(c, BC_GETIDX);
+            return true;
         case AST_BINARY_OP:
             if (!bc_compile_expr(c, e->binary_op.left)) return false;
             if (!bc_compile_expr(c, e->binary_op.right)) return false;
@@ -2452,6 +2463,34 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 Value snapshot = binding ? binding->value : make_null();
                 Value result = invoke_callee(native, snapshot, cargc, cargs);
                 for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
+                BC_PUSH(result);
+                break;
+            }
+            case BC_GETIDX: {
+                // Round 9: arr[idx]. A line-for-line mirror of the
+                // tree-walker's AST_INDEX_EXPR case — same order (idx, then
+                // arr off the stack), same bounds rules (int idx, 0 <= idx <
+                // count, else null), same clone semantics: strings strdup,
+                // nested arrays SHARED with no refcount bump (the tree-walker
+                // quirk, preserved bit-for-bit), scalars copied raw.
+                Value idx; BC_POP(idx);
+                Value arr; BC_POP(arr);
+                Value result = make_null();
+                if (arr.type == VAL_ARRAY && idx.type == VAL_INT) {
+                    if (idx.int_val >= 0 && (size_t)idx.int_val < arr.array_val->count) {
+                        Value elem = arr.array_val->items[idx.int_val];
+                        if (elem.type == VAL_STRING) {
+                            result = make_string(elem.string_val);
+                        } else if (elem.type == VAL_ARRAY) {
+                            result.type = VAL_ARRAY;
+                            result.array_val = elem.array_val; // shared, no bump (quirk)
+                        } else {
+                            result = elem;
+                        }
+                    }
+                }
+                value_free(&arr);
+                value_free(&idx);
                 BC_PUSH(result);
                 break;
             }
