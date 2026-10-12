@@ -1668,7 +1668,8 @@ typedef enum {
     BC_RET,      // pop return value; function exits
     BC_ECHO,     // pop; value_print + newline (echo statement)
     BC_MKARR,    // imm: u16 n — pop n elements, push array literal (round 7)
-    BC_CALLM     // dotted call: imm u8 argc, u16 site, u16 full-name idx, u16 member idx (round 7)
+    BC_CALLM,    // dotted call: imm u8 argc, u16 site, u16 full-name idx, u16 member idx (round 7)
+    BC_SLOT_BIN  // imm: u16 slot, u8 op — local[slot] = local[slot] <op> TOS, in place (round 8)
 } BcOpcode;
 // --- break/continue patch lists (perf round 5: loops) ---
 // BREAK/CONTINUE compile to a plain BC_JMP whose operand is recorded here
@@ -2021,14 +2022,13 @@ static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
             size_t loop_body_start = c->len;
             if (!bc_compile_stmt(c, s->cruise_stmt.body)) return false;
             size_t cont_at = c->len;
-            bc_put(c, BC_GETL);
-            bc_put16(c, (uint16_t)islot);
+            // Perf round 8: increment via one BC_SLOT_BIN (in-place i += 1)
+            // instead of GETL/INT/BIN/SETL_POP — same fold as x = x + rhs.
             bc_put(c, BC_INT);
             bc_put64(c, 1);
-            bc_put(c, BC_BIN);
-            bc_put(c, (uint8_t)OP_ADD);
-            bc_put(c, BC_SETL_POP);
+            bc_put(c, BC_SLOT_BIN);
             bc_put16(c, (uint16_t)islot);
+            bc_put(c, (uint8_t)OP_ADD);
             bc_put(c, BC_JMP);
             bc_put16(c, (uint16_t)cond_at);
             size_t end_at = c->len;
@@ -2075,8 +2075,33 @@ static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
         }
         case AST_ASSIGN_EXPR: {
             if (s->assign_expr.target->type != AST_IDENTIFIER) return false;
-            if (!bc_compile_expr(c, s->assign_expr.value)) return false;
             const char* name = s->assign_expr.target->identifier.name;
+            // Perf round 8: x = x <op> rhs with slotted x compiles to one
+            // BC_SLOT_BIN (slot read-modify-write, no clone/free round-trip
+            // through GETL/BIN/SETL_POP). Only for the shape whose left
+            // operand IS the assigned slot — no reassociation, so evaluation
+            // order and semantics stay bit-identical to the tree-walker.
+            if (s->assign_expr.value &&
+                s->assign_expr.value->type == AST_BINARY_OP) {
+                OperatorType aop = s->assign_expr.value->binary_op.op;
+                if (aop == OP_ADD || aop == OP_SUB || aop == OP_MUL ||
+                    aop == OP_DIV || aop == OP_MOD) {
+                    ASTNode* lhs = s->assign_expr.value->binary_op.left;
+                    if (lhs->type == AST_IDENTIFIER &&
+                        bc_slot_of(c, name) >= 0 &&
+                        bc_slot_of(c, lhs->identifier.name) ==
+                            bc_slot_of(c, name)) {
+                        int slot = bc_slot_of(c, name);
+                        if (!bc_compile_expr(c, s->assign_expr.value->binary_op.right))
+                            return false;
+                        bc_put(c, BC_SLOT_BIN);
+                        bc_put16(c, (uint16_t)slot);
+                        bc_put(c, (uint8_t)aop);
+                        return true;
+                    }
+                }
+            }
+            if (!bc_compile_expr(c, s->assign_expr.value)) return false;
             int slot = bc_slot_of(c, name);
             if (slot >= 0) {
                 bc_put(c, BC_SETL_POP);
@@ -2428,6 +2453,41 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 Value result = invoke_callee(native, snapshot, cargc, cargs);
                 for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
                 BC_PUSH(result);
+                break;
+            }
+            case BC_SLOT_BIN: {
+                // Perf round 8: local[slot] = local[slot] <op> TOS, in place.
+                // In-place lanes for numeric types (int arithmetic incl. the
+                // div/mod-by-zero → null rule, float ADD) — exact re-
+                // implementations of binop_apply's cases. Every other shape
+                // clones the slot exactly like BC_GETL and runs the very same
+                // binop_apply as BC_BIN, so semantics stay bit-identical to
+                // the tree-walker.
+                uint16_t slot = ip[0] | (ip[1] << 8);
+                uint8_t bop = ip[2];
+                ip += 3;
+                Value right; BC_POP(right);
+                Value* dst = &slots[slot];
+                if (bop == OP_ADD &&
+                    ((dst->type == VAL_INT && right.type == VAL_INT) ||
+                     (dst->type == VAL_FLOAT && right.type == VAL_FLOAT))) {
+                    if (dst->type == VAL_INT) dst->int_val += right.int_val;
+                    else dst->float_val += right.float_val;
+                } else if ((bop == OP_SUB || bop == OP_MUL) &&
+                           dst->type == VAL_INT && right.type == VAL_INT) {
+                    if (bop == OP_SUB) dst->int_val -= right.int_val;
+                    else dst->int_val *= right.int_val;
+                } else if ((bop == OP_DIV || bop == OP_MOD) &&
+                           dst->type == VAL_INT && right.type == VAL_INT &&
+                           right.int_val != 0) {
+                    if (bop == OP_DIV) dst->int_val /= right.int_val;
+                    else dst->int_val %= right.int_val;
+                } else {
+                    Value result = binop_apply((OperatorType)bop,
+                                               value_clone_impl(*dst), right);
+                    value_free(dst);
+                    *dst = result;
+                }
                 break;
             }
             default:
