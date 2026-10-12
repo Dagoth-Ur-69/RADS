@@ -1657,8 +1657,25 @@ typedef enum {
     BC_JMPF,     // imm: u16 abs offset — pop; jump if !truthy
     BC_CALL,     // imm: u8 argc, u16 call-site idx
     BC_POP,      // pop and discard
-    BC_RET       // pop return value; function exits
+    BC_RET,      // pop return value; function exits
+    BC_ECHO      // pop; value_print + newline (echo statement)
 } BcOpcode;
+// --- break/continue patch lists (perf round 5: loops) ---
+// BREAK/CONTINUE compile to a plain BC_JMP whose operand is recorded here
+// and fixed up by the innermost enclosing loop when it closes. Correct even
+// through nested ifs: every pending site inside the body range gets the same
+// target; inner loops have already claimed their own sites by closing first.
+typedef struct BcLoopPatch {
+    size_t at;      // offset of the jump operand to patch
+    int kind;       // 0 = break, 1 = continue
+} BcLoopPatch;
+
+#define BC_MAX_LOOP_PATCHES 256
+typedef struct BcLoopPatchList {
+    BcLoopPatch items[BC_MAX_LOOP_PATCHES];
+    size_t count;
+    struct BcLoopPatchList* next; // outer function nesting level
+} BcLoopPatchList;
 
 #define BC_MAX_SLOTS 256
 #define BC_MAX_ARGS  16
@@ -1686,6 +1703,7 @@ typedef struct BcCompiler {
     size_t site_count, site_cap;
     const char* slot_names[BC_MAX_SLOTS]; // interned via env_intern
     int nslots;
+    BcLoopPatchList* loops; // innermost-open loop patch scope
     bool ok; // false once any emit/compile error happens
 } BcCompiler;
 
@@ -1718,6 +1736,57 @@ static void bc_patch_jump(BcCompiler* c, size_t at) {
     c->code[at] = target & 0xff;
     c->code[at + 1] = (target >> 8) & 0xff;
 }
+
+static void bc_break_patch(BcCompiler* c) {
+    // record under the innermost open loop scope
+    BcLoopPatchList* pl = c->loops;
+    if (!pl) { c->ok = false; return; } // break outside a loop — bail
+    if (pl->count >= BC_MAX_LOOP_PATCHES) { c->ok = false; return; }
+    pl->items[pl->count].at = c->len;
+    pl->items[pl->count].kind = 0;
+    pl->count++;
+}
+
+static void bc_cont_patch(BcCompiler* c) {
+    BcLoopPatchList* pl = c->loops;
+    if (!pl) { c->ok = false; return; }
+    if (pl->count >= BC_MAX_LOOP_PATCHES) { c->ok = false; return; }
+    pl->items[pl->count].at = c->len;
+    pl->items[pl->count].kind = 1;
+    pl->count++;
+}
+
+// Close the innermost loop: patch every pending break→end_at and
+// continue→cont_at whose site offset lies in [body_start, end_at), then pop
+// the list. Sites from outer loops remain for their own close.
+static void bc_patch_loops(BcCompiler* c, size_t body_start, size_t cont_at, size_t end_at) {
+    BcLoopPatchList* pl = c->loops;
+    if (!pl) return;
+    for (size_t i = 0; i < pl->count; i++) {
+        if (pl->items[i].at < body_start || pl->items[i].at >= end_at) continue;
+        uint16_t target = (uint16_t)(pl->items[i].kind == 0 ? end_at : cont_at);
+        c->code[pl->items[i].at] = target & 0xff;
+        c->code[pl->items[i].at + 1] = (target >> 8) & 0xff;
+    }
+    // Remove the patched entries (keep any outer-loop leftovers at the front).
+    size_t kept = 0;
+    for (size_t i = 0; i < pl->count; i++) {
+        if (pl->items[i].at >= end_at) pl->items[kept++] = pl->items[i];
+    }
+    pl->count = kept;
+    c->loops = pl->next;
+    free(pl);
+}
+
+// Open a loop scope. Returns false on OOM (bails compilation).
+static bool bc_open_loop(BcCompiler* c) {
+    BcLoopPatchList* pl = calloc(1, sizeof(BcLoopPatchList));
+    if (!pl) { c->ok = false; return false; }
+    pl->next = c->loops;
+    c->loops = pl;
+    return true;
+}
+
 
 static uint16_t bc_const_idx(BcCompiler* c, const char* s) {
     for (size_t i = 0; i < c->const_count; i++) {
@@ -1830,6 +1899,94 @@ static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
             bc_patch_jump(c, jend);
             return true;
         }
+        case AST_LOOP_STMT: {
+            // while (cond) body  →
+            //   Lcond: <cond>; JMPF Lend; <body>; JMP Lcond; Lend:
+            if (!bc_open_loop(c)) return false;
+            size_t cond_at = c->len;
+            if (!bc_compile_expr(c, s->loop_stmt.condition)) return false;
+            size_t jf = bc_emit_jump(c, BC_JMPF);
+            size_t loop_body_start = c->len;
+            if (!bc_compile_stmt(c, s->loop_stmt.body)) return false;
+            size_t cont_at = c->len;
+            bc_put(c, BC_JMP);
+            bc_put16(c, (uint16_t)cond_at);
+            size_t end_at = c->len;
+            bc_patch_jump(c, jf);
+            bc_patch_loops(c, loop_body_start, cont_at, end_at);
+            return true;
+        }
+        case AST_CRUISE_STMT: {
+            ASTNode* iter = s->cruise_stmt.iterable;
+            if (!iter || iter->type != AST_BINARY_OP || iter->binary_op.op != OP_RANGE) {
+                return false; // only range-loops in the BC subset
+            }
+            if (!s->cruise_stmt.iterator) return false;
+            // cruise (i in a..b) body  →
+            //   <a>; SETL_POP i; <b>; SETL_POP $end;
+            //   Lcond: GETL i; GETL $end; BIN <; JMPF Lend;
+            //   <body>; Lstep: GETL i; INT 1; BIN +; SETL_POP i; JMP Lcond;
+            //   Lend:
+            // Bit-identical to the tree-walker: start/end evaluated once
+            // before the loop; non-int bounds coerce to 0 via binop_apply's
+            // null result and OP_LT's null comparison semantics; $end lives
+            // in a hidden slot whose name cannot collide with identifiers.
+            if (!bc_open_loop(c)) return false;
+            if (!bc_compile_expr(c, iter->binary_op.left)) return false;
+            int islot = bc_slot_of(c, s->cruise_stmt.iterator);
+            if (islot < 0) islot = bc_new_slot(c, s->cruise_stmt.iterator);
+            if (islot < 0) return false;
+            bc_put(c, BC_SETL_POP);
+            bc_put16(c, (uint16_t)islot);
+
+            if (!bc_compile_expr(c, iter->binary_op.right)) return false;
+            // Hidden slot: intern a name no identifier can produce.
+            int eslot = bc_new_slot(c, "$range_end$");
+            if (eslot < 0) return false;
+            bc_put(c, BC_SETL_POP);
+            bc_put16(c, (uint16_t)eslot);
+
+            size_t cond_at = c->len;
+            bc_put(c, BC_GETL);
+            bc_put16(c, (uint16_t)islot);
+            bc_put(c, BC_GETL);
+            bc_put16(c, (uint16_t)eslot);
+            bc_put(c, BC_BIN);
+            bc_put(c, (uint8_t)OP_LT);
+            size_t jf = bc_emit_jump(c, BC_JMPF);
+            size_t loop_body_start = c->len;
+            if (!bc_compile_stmt(c, s->cruise_stmt.body)) return false;
+            size_t cont_at = c->len;
+            bc_put(c, BC_GETL);
+            bc_put16(c, (uint16_t)islot);
+            bc_put(c, BC_INT);
+            bc_put64(c, 1);
+            bc_put(c, BC_BIN);
+            bc_put(c, (uint8_t)OP_ADD);
+            bc_put(c, BC_SETL_POP);
+            bc_put16(c, (uint16_t)islot);
+            bc_put(c, BC_JMP);
+            bc_put16(c, (uint16_t)cond_at);
+            size_t end_at = c->len;
+            bc_patch_jump(c, jf);
+            bc_patch_loops(c, loop_body_start, cont_at, end_at);
+            return true;
+        }
+        case AST_BREAK_STMT:
+            bc_put(c, BC_JMP);
+            bc_break_patch(c); // fixed up to loop end by the enclosing loop
+            return true;
+        case AST_CONTINUE_STMT:
+            bc_put(c, BC_JMP);
+            bc_cont_patch(c); // fixed up to the step/cond by the enclosing loop
+            return true;
+        case AST_ECHO_STMT:
+            // echo(expr) — same semantics as the tree-walker: evaluate,
+            // print, free. Compiles as call(expr) + POP so the expression
+            // subset is reused wholesale.
+            if (!bc_compile_expr(c, s->echo_stmt.expression)) return false;
+            bc_put(c, BC_ECHO);
+            return true;
         case AST_RETURN_STMT:
             if (s->return_stmt.value) {
                 if (!bc_compile_expr(c, s->return_stmt.value)) return false;
@@ -1901,7 +2058,13 @@ static bool bc_compile(ASTNode* func, BcFunc** out) {
     }
 
     if (!bc_compile_stmt(&c, func->function_decl.body)) {
+        if (getenv("RADS_BC_TRACE")) fprintf(stderr, "[bc] bail: %s\n", func->function_decl.name ? func->function_decl.name : "<anon>");
         free(c.code); free(c.consts); free(c.call_sites);
+        while (c.loops) {
+            BcLoopPatchList* next = c.loops->next;
+            free(c.loops);
+            c.loops = next;
+        }
         return false;
     }
     // Implicit `return null` fallthrough.
@@ -2056,6 +2219,13 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 for (int i = 0; i < f->nslots; i++) value_free(&slots[i]);
                 return rv;
             }
+            case BC_ECHO: {
+                Value v; BC_POP(v);
+                value_print(&v);
+                printf("\n");
+                value_free(&v);
+                break;
+            }
             default:
                 goto bad_opcode;
         }
@@ -2194,7 +2364,11 @@ int interpret(ASTNode* program) {
     // Pass 2: Execute main function if it exists
     Value main_val = env_get("main");
     if (main_val.type == VAL_FUNCTION) {
-        exec_statement(main_val.func_node->function_decl.body);
+        // Route main() through the callback path so its body compiles to
+        // bytecode like any other blast function (loops in main are the
+        // benchmark hot path). interpret_repl/global-scope semantics are
+        // unchanged: no params, global env visible.
+        interpreter_execute_callback(main_val, 0, NULL);
         value_free(&main_val);
     } else {
         // Fallback: search declarations (legacy)
