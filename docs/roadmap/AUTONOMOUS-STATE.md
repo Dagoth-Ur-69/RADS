@@ -1,74 +1,94 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-12 (cron run 7)
+Last updated: 2026-10-12 (cron run 8)
 Branch: `phase0/build-recovery`
-HEAD: `1c81445` perf(core): bytecode VM fast path for blast function bodies
+HEAD: `04c1ac3` fix(build): stop 'make clean' deleting tracked rads-mask test fixtures
 
 ## What this run changed
 
-**Perf round 4 from the journal — the bytecode prototype — landed as
-`1c81445` and it WORKS.** fib(28): 135.7 → **100.6 ms (-26%)**; vs the
-run-5 baseline of 186 ms it's -46%. Gap to CPython: 2.3x → **1.6x**.
-RADS beats CPython 3/4, Node 4/4 (fib now beats Node outright).
+**Perf round 5 from the journal — loops in the bytecode VM — landed as
+`30f255f`, plus the rads-mask deleter is finally dead (`04c1ac3`).**
 
-Design (all in `src/core/interpreter.c`, ~450 lines + ast.h/ast.c cache
-field `function_decl.bc_cache`):
+Work done in a git worktree (`/home/zari/Desktop/RADS-wt-bc`) because the
+main checkout sat on a dirty `nightshift/20261012-fix-bisect-build` branch
+with someone's uncommitted stdlib work (heapq/logging/statistics + a stray
+root `rads-mask` binary) — untouched. NOTE for next run: check which branch
+the main checkout is on; if still dirty nightshift, keep using worktrees.
 
-1. **Subset compiler.** `blast` bodies using only block/if/return/var-decl/
-   assign/expression-statements over literals, identifiers, binary ops and
-   identifier-callee calls compile once (first invocation) to a compact
-   stack bytecode (16 opcodes). Slotted locals replace the linked-list
-   frame: params + locals get fixed slots, lookup is an array index.
-   Anything else bails at compile time → `bc_cache = (void*)1` →
-   tree-walks forever. Fully transparent fallback.
-2. **Dispatch loop** (`vm_run`): computed-goto-free plain switch, fixed
-   Value stack, inlined int fast paths (GETL trivial-copy, JMPF int test,
-   binop via shared `binop_apply`). BC_CALL reuses the exact tree-walker
-   resolution: `resolve_callee_cached` + `invoke_callee` (extracted from
-   `eval_call` in this run — the callee cache from round 3 applies to
-   bytecode call sites too).
-3. **`RADS_NO_BC=1`** env kill-switch for A/B benchmarking.
-4. Note: `src/vm/{vm.c,vm.h}` is an older dead orphan (own Value type,
-   wired to nothing) — candidate for archive/removal next hygiene pass.
+### Loops in the BC subset (`30f255f`)
 
-Also this run: restored tracked `tools/rads-mask/tests/*.rads` that showed
-as deleted in git status (stray; nothing in the build deletes them — watch
-for recurrence).
+- `cruise (i in a..b)` range loops, `loop (cond)` while-loops, `break`,
+  `continue` now compile to bytecode. break/continue are plain BC_JMPs
+  recorded in per-loop patch lists, fixed up when the loop closes — correct
+  through nested ifs and nested loops (inner loop closes first and claims
+  its own sites).
+- cruise bounds: start/end evaluated once into slots; `$range_end$` hidden
+  slot (interned name no identifier can produce). Condition via
+  binop_apply OP_LT — bit-identical tree-walker semantics, verified by A/B
+  (RADS_NO_BC=1) on nested-loop/break/continue/empty-range/while tests.
+- **`echo` statement added to the subset (BC_ECHO)** — the trap of the run:
+  every benchmark main() ends in `echo(...)`, so without it loop
+  compilation NEVER fired for the benchmarks (main bailed to tree-walk).
+  Found via new `RADS_BC_TRACE=1` env flag (prints compile-bail fn names).
+- **`main()` now routes through `interpreter_execute_callback`** instead of
+  raw exec_statement — its body compiles to bytecode like any blast
+  function. Global-scope semantics unchanged (no params, globals visible).
+- Numbers (best-of-5 wall): 2M-iter cruise micro 187→**158ms (-15%)**;
+  official suite: fib 100.6→95.8, string_build 58.0→**53.5**,
+  array_churn 13.3→12.8, file_io 23.2→21.6. array_churn gains are modest
+  because its inner work is native `array.*` calls, not loop arithmetic.
+- Suite 7/8 (known pre-existing fail), ASAN+UBSAN clean on all workloads
+  and loop stress tests.
+
+### rads-mask deleter solved (`04c1ac3`)
+
+Journal runs 6/7 flagged `tools/rads-mask/tests/*.rads` showing as deleted.
+Root cause: `tools/rads-mask/Makefile` clean target had `rm -f tests/*.rads`
+(intended to clear GENERATED transpiler outputs), and the root Makefile's
+`clean` cascades `make -C tools/rads-mask clean` — so every `make clean`
+wiped tracked fixtures. Fixed at source; verified `make clean` now leaves
+zero git deletions.
 
 ## Test results
 
-- `make`: green (0 errors; pre-existing stdlib unused-param warnings only).
+- `make`: green (pre-existing stdlib warnings only).
 - `run_tests.sh`: **7/8** — the 1 fail is the known pre-existing
-  `v0_0_7_comprehensive.rads`, unchanged.
-- Sanitize build (ASAN+UBSAN+LSAN): all 4 benchmarks + full suite run
+  `v0_0_7_comprehensive.rads` (await-in-nested-scope parser gap), unchanged.
+- Sanitize build (ASAN+UBSAN+LSAN): all 4 benchmarks + loop stress tests
   clean (leak noise pre-existing).
-- Benchmarks (results/20261012T024458Z.json): fib **100.6** / string_build
-  58.0 / array_churn 13.3 / file_io 23.2 vs CPython 62.8/21.1/16.3/36.4
-  and Node 112.5/110.9/112.2/132.6.
-- A/B verified: RADS_NO_BC=1 fib ≈ 152ms vs 104ms enabled (wall clock).
+- Benchmarks (results/20261012T055804Z.json): fib **95.8** / string_build
+  **53.5** / array_churn **12.8** / file_io **21.6** vs CPython
+  58.3/20.6/14.4/35.8 and Node 105.0/101.0/103.2/124.8.
 
 ## Next up (single task for next run)
 
-**Perf round 5: widen the bytecode subset to loops.** `while` (loop_stmt)
-and `cruise` (range for-loops) in the BC compiler + opcodes
-(BC_LOOP / BC_GETI iteration), so array_churn's hot loops and general
-user code compile too. Same rules: compile-bail fallback, suite green,
-ASAN clean, `bash benchmarks/run.sh` before/after. Stretch: string
-concat (OP_ADD on strings) inline in BC_BIN to move string_build.
+**Perf round 6 candidates, pick ONE:**
+1. **String concat inline in BC_BIN** (round-5 stretch, still open): OP_ADD
+   on (string,int) fast path without the 256-byte buffer dance in
+   binop_apply. string_build is 2.6x off CPython — biggest gap.
+2. **In-place slot arithmetic for `x = x + ...`**: avoid clone/free of the
+   LHS slot; array_churn's accumulate loop is the target.
+3. **Widen subset: index/member expressions** (`arr[i]`, `arr.length`) as
+   opcodes — array_churn's `array.pop` calls could become BC ops.
+
+Rules unchanged: compile-bail fallback, suite 7/8 minimum, ASAN clean,
+`bash benchmarks/run.sh` before/after, A/B with RADS_NO_BC=1.
 If it stalls >10 min, fall back to the AGENTS.md workstream priority.
 
 ## Open blockers
 
-- `git push` still fails: no credentials. **20 commits** now await push
-  locally on `phase0/build-recovery`. Needs PAT or `gh auth login` by
-  the owner (GitHub account colyzeo@gmail.com).
-- `v0_0_7_comprehensive.rads` + stray tests/*.rads use unsupported
-  syntax (`#`, `fn`, `let`) — rewrite or implement; candidate work.
+- `git push` still fails: no credentials. **28 commits** now await push
+  locally on `phase0/build-recovery` (+2 this run). Needs PAT or
+  `gh auth login` by the owner (GitHub account colyzeo@gmail.com).
+- `v0_0_7_comprehensive.rads` uses unsupported syntax (`await` in nested
+  scope, `#`, `fn`, `let`) — rewrite or implement; candidate work.
 - Pre-existing gcc warnings (unused vars/fns in stdlib_net, functools,
   parser.c:648) — cosmetic.
 - `.gitignore` line 57 `core` matches `src/core` — `git add -f` for
   core changes (hit again this run, expected).
 - LeakSanitizer pre-existing leaks (AST/parser/csv/env stdlib) —
   hygiene workstream, not blocking.
-- Watch: `tools/rads-mask/tests/*.rads` showed as deleted twice now
-  (restored both times); find the deleter if it recurs.
+- ~~rads-mask tests deleted by clean~~ — SOLVED this run (`04c1ac3`).
+- `benchmarks/rads/` was untracked in git (run.sh referenced it, files
+  only existed in the dirty main checkout) — committed this run. Watch
+  that the nightshift branch doesn't also carry a conflicting copy.
