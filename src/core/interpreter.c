@@ -920,13 +920,16 @@ static Value binop_apply(OperatorType op, Value left, Value right) {
                     strcpy(right_buf, "null");
                 }
 
-                // Concatenate
-                size_t len = strlen(left_str) + strlen(right_str) + 1;
-                char* str = malloc(len);
-                strcpy(str, left_str);
-                strcat(str, right_str);
-                result = make_string(str);
-                free(str);
+                // Concatenate — single pass: lengths computed once, one
+                // malloc, two memcpys, Value built in place. The old
+                // strcpy/strcat/make_string(strdup)/free sequence made four
+                // passes over the left operand per binop.
+                size_t llen = strlen(left_str), rlen = strlen(right_str);
+                char* str = malloc(llen + rlen + 1);
+                memcpy(str, left_str, llen);
+                memcpy(str + llen, right_str, rlen + 1);
+                result.type = VAL_STRING;
+                result.string_val = str;
             }
             break;
         case OP_RANGE:
@@ -1831,10 +1834,17 @@ static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
             bc_put(c, BC_INT);
             bc_put64(c, (uint64_t)e->integer_literal.value);
             return true;
-        case AST_FLOAT_LITERAL:
+        case AST_FLOAT_LITERAL: {
+            // Store the raw bit pattern, NOT (uint64_t)double — that value
+            // cast truncates 0.5 to 0. Bit-exact round-trip with the VM's
+            // memcpy read. (Bug caught by run-9 string/float concat probe.)
+            double d = e->float_literal.value;
+            uint64_t bits;
+            memcpy(&bits, &d, 8);
             bc_put(c, BC_FLOAT);
-            bc_put64(c, (uint64_t)e->float_literal.value); // bit pattern
+            bc_put64(c, bits);
             return true;
+        }
         case AST_BOOL_LITERAL:
             bc_put(c, e->bool_literal.value ? BC_TRUE : BC_FALSE);
             return true;
@@ -2173,6 +2183,57 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 Value right, left;
                 BC_POP(right);
                 BC_POP(left);
+                // Fast paths for OP_ADD (perf round 6): skip the generic
+                // binop_apply dispatch and, for string operands, the 256-byte
+                // stack-buffer conversion dance + intermediate copies. int/str
+                // and str/int render through a small local buffer exactly as
+                // snprintf("%lld") would; anything else falls through.
+                if (bop == OP_ADD) {
+                    if (left.type == VAL_INT && right.type == VAL_INT) {
+                        BC_PUSH(make_int(left.int_val + right.int_val));
+                        break;
+                    }
+                    if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
+                        BC_PUSH(make_float(left.float_val + right.float_val));
+                        break;
+                    }
+                    if (left.type == VAL_STRING && right.type == VAL_STRING) {
+                        size_t llen = strlen(left.string_val);
+                        size_t rlen = strlen(right.string_val);
+                        char* s = malloc(llen + rlen + 1);
+                        memcpy(s, left.string_val, llen);
+                        memcpy(s + llen, right.string_val, rlen + 1);
+                        free(left.string_val);
+                        free(right.string_val);
+                        Value r; r.type = VAL_STRING; r.string_val = s;
+                        BC_PUSH(r);
+                        break;
+                    }
+                    if (left.type == VAL_STRING && right.type == VAL_INT) {
+                        char buf[32];
+                        int n = snprintf(buf, sizeof(buf), "%lld", right.int_val);
+                        size_t llen = strlen(left.string_val);
+                        char* s = malloc(llen + (size_t)n + 1);
+                        memcpy(s, left.string_val, llen);
+                        memcpy(s + llen, buf, (size_t)n + 1);
+                        free(left.string_val);
+                        Value r; r.type = VAL_STRING; r.string_val = s;
+                        BC_PUSH(r);
+                        break;
+                    }
+                    if (left.type == VAL_INT && right.type == VAL_STRING) {
+                        char buf[32];
+                        int n = snprintf(buf, sizeof(buf), "%lld", left.int_val);
+                        size_t rlen = strlen(right.string_val);
+                        char* s = malloc((size_t)n + rlen + 1);
+                        memcpy(s, buf, (size_t)n);
+                        memcpy(s + n, right.string_val, rlen + 1);
+                        free(right.string_val);
+                        Value r; r.type = VAL_STRING; r.string_val = s;
+                        BC_PUSH(r);
+                        break;
+                    }
+                }
                 BC_PUSH(binop_apply((OperatorType)bop, left, right));
                 break;
             }
