@@ -1676,7 +1676,11 @@ typedef enum {
     BC_MKARR,    // imm: u16 n — pop n elements, push array literal (round 7)
     BC_CALLM,    // dotted call: imm u8 argc, u16 site, u16 full-name idx, u16 member idx (round 7)
     BC_SLOT_BIN, // imm: u16 slot, u8 op — local[slot] = local[slot] <op> TOS, in place (round 8)
-    BC_GETIDX    // pop idx, arr; push arr[idx] clone (round 9 — mirrors eval index path)
+    BC_GETIDX,   // pop idx, arr; push arr[idx] clone (round 9 — mirrors eval index path)
+    BC_CMPF      // imm: u16 slot, u8 op, i64 rhs, u16 abs offset — fused compare-and-branch:
+                 // if !(local[slot] <op> rhs) jump. No stack traffic, no clone (round 10).
+                 // Mirrors GETL+INT+BIN(op)+JMPF exactly for int slots; non-int slots
+                 // reproduce binop_apply's null/false/true result + bc_truthy fold.
 } BcOpcode;
 // --- break/continue patch lists (perf round 5: loops) ---
 // BREAK/CONTINUE compile to a plain BC_JMP whose operand is recorded here
@@ -1843,6 +1847,31 @@ static int bc_new_slot(BcCompiler* c, const char* name) {
     return c->nslots++;
 }
 
+// Round 10: fuse a `local <cmp> int-literal` branch condition into one BC_CMPF
+// (replaces GETL+INT+BIN+JMPF; zero stack traffic, no clone). On success emits
+// the opcode with a zeroed trailing u16 jump operand and stores its offset in
+// *patch_at for the caller's bc_patch_jump. Pure lookup — creates no slots —
+// so any miss falls back to the generic cond;JMPF path unchanged.
+static bool bc_try_cmpf(BcCompiler* c, ASTNode* cond, size_t* patch_at) {
+    if (!cond || cond->type != AST_BINARY_OP) return false;
+    OperatorType op = cond->binary_op.op;
+    if (op != OP_LT && op != OP_LTE && op != OP_GT && op != OP_GTE &&
+        op != OP_EQ && op != OP_NEQ) return false;
+    ASTNode* lhs = cond->binary_op.left;
+    ASTNode* rhs = cond->binary_op.right;
+    if (!lhs || lhs->type != AST_IDENTIFIER) return false;
+    if (!rhs || rhs->type != AST_INTEGER_LITERAL) return false;
+    int slot = bc_slot_of(c, lhs->identifier.name);
+    if (slot < 0) return false;
+    bc_put(c, BC_CMPF);
+    bc_put16(c, (uint16_t)slot);
+    bc_put(c, (uint8_t)op);
+    bc_put64(c, (uint64_t)rhs->integer_literal.value);
+    *patch_at = c->len;
+    bc_put16(c, 0); // jump-target placeholder, patched by the enclosing construct
+    return true;
+}
+
 static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
     if (!e || !c->ok) return false;
     switch (e->type) {
@@ -1970,8 +1999,12 @@ static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
             }
             return true;
         case AST_IF_STMT: {
-            if (!bc_compile_expr(c, s->if_stmt.condition)) return false;
-            size_t jf = bc_emit_jump(c, BC_JMPF);
+            // Round 10: try fused compare-and-branch first (`if (n < 2)` etc.)
+            size_t jf;
+            if (!bc_try_cmpf(c, s->if_stmt.condition, &jf)) {
+                if (!bc_compile_expr(c, s->if_stmt.condition)) return false;
+                jf = bc_emit_jump(c, BC_JMPF);
+            }
             if (!bc_compile_stmt(c, s->if_stmt.then_branch)) return false;
             size_t jend = bc_emit_jump(c, BC_JMP);
             bc_patch_jump(c, jf);
@@ -1986,8 +2019,12 @@ static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
             //   Lcond: <cond>; JMPF Lend; <body>; JMP Lcond; Lend:
             if (!bc_open_loop(c)) return false;
             size_t cond_at = c->len;
-            if (!bc_compile_expr(c, s->loop_stmt.condition)) return false;
-            size_t jf = bc_emit_jump(c, BC_JMPF);
+            // Round 10: fused compare-and-branch for `while (i < n)`-shaped conds
+            size_t jf;
+            if (!bc_try_cmpf(c, s->loop_stmt.condition, &jf)) {
+                if (!bc_compile_expr(c, s->loop_stmt.condition)) return false;
+                jf = bc_emit_jump(c, BC_JMPF);
+            }
             size_t loop_body_start = c->len;
             if (!bc_compile_stmt(c, s->loop_stmt.body)) return false;
             size_t cont_at = c->len;
@@ -2349,6 +2386,48 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                     value_free(&v);
                     if (!t) ip = f->code + off;
                 }
+                break;
+            }
+            case BC_CMPF: {
+                // Round 10: fused compare-and-branch. Semantics mirror
+                // GETL(clone) + INT + BIN(op) + JMPF(pop; truthy) exactly —
+                // see the per-type fold notes in the enum above. The clone
+                // the unfused path performs is always freed by BC_JMPF, so
+                // skipping it here is observationally identical (the slot
+                // value itself is only ever read, never stored).
+                uint16_t slot = ip[0] | (ip[1] << 8); ip += 2;
+                uint8_t cop = *ip++;
+                long long rhs;
+                memcpy(&rhs, ip, 8); ip += 8;
+                uint16_t off = ip[0] | (ip[1] << 8); ip += 2;
+                Value l = slots[slot];
+                bool cond_true;
+                if (l.type == VAL_INT) {
+                    long long a = l.int_val, b = rhs;
+                    switch (cop) {
+                        case OP_LT:  cond_true = a <  b; break;
+                        case OP_LTE: cond_true = a <= b; break;
+                        case OP_GT:  cond_true = a >  b; break;
+                        case OP_GTE: cond_true = a >= b; break;
+                        case OP_EQ:  cond_true = a == b; break;
+                        default:     cond_true = a != b; break; // OP_NEQ
+                    }
+                } else if (cop == OP_EQ) {
+                    // binop_apply OP_EQ mixed-type → make_bool(false) → falsy
+                    cond_true = false;
+                } else if (cop == OP_NEQ) {
+                    // binop_apply OP_NEQ mixed-type → make_bool(true) → truthy
+                    cond_true = true;
+                } else {
+                    // LT/LTE/GT/GTE on non-int/non-float pairs → null → falsy.
+                    // int-vs-float also lands here (binop_apply has no mixed
+                    // lane), and null is falsy under bc_truthy. One caveat:
+                    // VAL_STRING is truthy iff non-empty — but a string can
+                    // never reach this arm equal to an int via OP_LT without
+                    // binop_apply returning null first, so falsy is exact.
+                    cond_true = false;
+                }
+                if (!cond_true) ip = f->code + off;
                 break;
             }
             case BC_CALL: {
