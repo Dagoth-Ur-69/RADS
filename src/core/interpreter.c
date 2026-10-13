@@ -1081,9 +1081,15 @@ static Value eval_expression(ASTNode* node) {
                     if (elem.type == VAL_STRING) {
                         result = make_string(elem.string_val);
                     } else if (elem.type == VAL_ARRAY) {
-                        // simplistic: not deep copy; share
+                        // Share the nested array but take our own reference:
+                        // the container below may hit refcount 0 in the
+                        // value_free(&arr) right after (literal temps like
+                        // [[1,2],[3,4]][1] have no other owner), which frees
+                        // the items and leaves the shared result dangling.
+                        // heap-use-after-free, run 13 probes A/B.
                         result.type = VAL_ARRAY;
                         result.array_val = elem.array_val;
+                        if (result.array_val) result.array_val->refcount++;
                     } else {
                         result = elem;
                     }
@@ -2482,8 +2488,12 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                         if (elem.type == VAL_STRING) {
                             result = make_string(elem.string_val);
                         } else if (elem.type == VAL_ARRAY) {
+                            // Mirror of the tree-walker fix (run 13): share
+                            // WITH a refcount bump, so the container's
+                            // value_free below can't strand the result.
                             result.type = VAL_ARRAY;
-                            result.array_val = elem.array_val; // shared, no bump (quirk)
+                            result.array_val = elem.array_val;
+                            if (result.array_val) result.array_val->refcount++;
                         } else {
                             result = elem;
                         }

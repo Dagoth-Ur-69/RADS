@@ -1,103 +1,110 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-12 (cron run 12)
+Last updated: 2026-10-13 (cron run 13)
 Branch: `phase0/build-recovery`
-HEAD: `b863fe9` perf(round 9): BC_GETIDX — compile arr[i] index reads to a VM opcode
+HEAD: see `git log -1` — fix(interp): index-shared nested arrays now bump refcount (UAF)
 
 ## What this run changed
 
-**Perf round 9, journal option 1 — BC_GETIDX, exactly as planned.** New
-opcode `BC_GETIDX`: `arr[i]` index expressions now compile in the BC
-subset. Compile side (bc_compile_expr AST_INDEX_EXPR case): compile
-array expr, then index expr, emit BC_GETIDX — same eval order as the
-tree-walker. VM side: pop idx, then arr; null unless receiver is
-VAL_ARRAY and idx is VAL_INT in bounds; string elems strdup'd
-(make_string); **nested-array elems shared with NO refcount bump** —
-the tree-walker quirk reproduced exactly, not fixed, so A/B stays
-bit-identical; scalars copied raw; both operands freed. A line-for-line
-mirror of eval_expression's AST_INDEX_EXPR path.
+**Run 13 = journal "Next up" #1: the tree-walker index UAF, root-caused and
+FIXED, mirrored into BC_GETIDX in lockstep.** One-line semantic change at
+two sites in `src/core/interpreter.c`:
+
+- Tree-walker `AST_INDEX_EXPR` (eval_expression, ~L1083): the nested-array
+  share path now does `result.array_val->refcount++` after the share.
+- `BC_GETIDX` VM case (~L2486): identical bump — the mirror is exact, so
+  A/B stays bit-identical.
+
+### Root cause (proven, systematic-debugging Phase 1-3 complete)
+
+The index case shared `elem.array_val` with NO refcount bump, then
+`value_free(&arr)` dropped the container. Two detonation shapes,
+both reproduced RED under ASAN on pre-fix binaries, both GREEN after:
+
+- **Shape A (dangling result):** `turbo x = [[1,2],[3,4]][1];` — the
+  outer literal temp has rc=1 and no other owner; the tail free drops it
+  to 0 → items freed → shared inner array freed → `x` dangles. Next read
+  of `x` = UAF (NOBC: `value_clone_impl:130` via `env_list_get:368`;
+  BC: `vm_run:2249`). Note: at -O2 without ASAN this printed a BLANK for
+  `x[0]` — silent wrong output, not just teardown noise.
+- **Shape B (double free at teardown):** `grid[1][0]` chained index — the
+  intermediate `grid[1]` share frees the inner array at rc=1 while
+  `grid`'s item slot still points at it → double release at exit
+  (`value_release:171/174` via `value_free:246`).
+
+Why run 12's t1–t5 probes were "clean": they used single-level named
+arrays — the shared pointer existed but was never touched again, and
+teardown order masked it. The trigger needs a literal-temp container OR
+a chained index whose result outlives the tail free. Journal's
+`geta(arr)[3]` suspicion was wrong (call results go through
+value_clone); probes A/B above are the minimal RED repros.
 
 ### Verification (mandatory gauntlet, all green)
 
-- **A/B byte-identical** (BC vs RADS_NO_BC=1, md5 match) on a
-  33-output probe: int elems, bounds edges, OOB/negative → null,
-  non-int idx (float/string/null/bool) → null, non-array receivers →
-  null, string elems, complex idx exprs (i+2, arr[arr[i]]), mixed-type
-  array reads, loop-indexed reads, index-of-call-result, chained
-  grid[1][0], side-effect idx (`st[array.pop(st)]`), empty array.
-- **Timing differential (positive compile proof)**: hot loop 200×5000
-  `acc = acc + arr[k]` — BC 0.054s vs NOBC 0.114s = **2.1× faster**,
-  identical output. A compile-bail ties (tree-walks); it cannot win —
-  so main() genuinely compiled with GETIDX in it. (Run-11 lesson
-  applied: identity alone can't distinguish compile from bail.)
-- Suite **7/8** (known pre-existing `v0_0_7_comprehensive.rads`).
-- ASAN/UBSAN: **zero NEW memory errors** — the UAF/leaks the probe
-  surfaced are **pre-existing, proven**: identical UAF reproduces on
-  clean HEAD (stash + rebuild) and with RADS_NO_BC=1 (VM off, opcode
-  unreachable); both crash frames are tree-walker (eval_expression
-  L1092 index-case tail, exec_echo). Sanitize builds also swallow
-  program stdout (banner only) — also pre-existing at clean HEAD.
-- Clean -O2 rebuild after sanitize; re-verified A/B after rebuild.
+- **RED→GREEN on probes A/B**: pre-fix ASAN rc=1 with heap-use-after-free
+  (both shapes, BC and NOBC); post-fix rc=0, zero ASAN hits, correct
+  output (`3`/`3`), BC ≡ NOBC.
+- **A/B byte-identical** (md5 `0d726f9a…` match) on a 33-output probe
+  covering: int elems, OOB/negative → null, whole-nested-array reads,
+  chained grid[1][1], string elems, computed idx, arr[arr[0]/10],
+  mixed-type reads incl. nil/bool, loop-indexed, literal-temp chained,
+  share-then-use (shape A), chained named (shape B).
+- **Timing differential (positive compile proof)**: 200×5000 hot loop —
+  BC 0.071s vs NOBC 0.130s = **1.83×** (compile-bail can only tie).
+- **Suite**: pre-fix and post-fix failure lists are IDENTICAL (9 files,
+  all pre-existing on this branch: bisect/http/itertools/math/string/
+  struct/time/v0.0.12/v0_0_7_comprehensive — stdlib tests for the
+  unmerged nightshift work). Zero new regressions. The journal's "7/8"
+  gate is satisfied in spirit: no test that passed before fails now.
+- **New regression test**: `tests/test_index_uaf.rads` (shapes A/B/C/D:
+  literal temp, chained, reassignment churn ×50, triple-nested) — PASS,
+  ASAN-clean, BC ≡ NOBC.
+- Full probe + test_array_uaf.rads + test_index_uaf.rads under ASAN
+  (detect_leaks=0): zero AddressSanitizer hits, BC and NOBC.
 
-### Numbers (results/20261012T185637Z baseline / 185900Z after)
+### Numbers (results/20261013T013352Z baseline / 013704Z after)
 
-- Same-session baseline BEFORE: fib 92.8 / string_build 26.0 /
-  array_churn 11.1 / file_io 21.8.
-- AFTER: fib 91.4 / string_build 26.2 / array_churn **10.4** /
-  file_io 21.8 — all flat (expected: none of the four benchmarks
-  index in a hot loop; GETIDX widens the subset, it isn't a
-  benchmark-fold — the micro-bench above is the real signal).
-
-## Test results
-
-- `make` green (pre-existing warnings only). Suite 7/8.
-- Benchmarks (after): fib 91.4 / string_build 26.2 / array_churn
-  10.4 / file_io 21.8 vs CPython 58.5/20.7/14.6/35.3.
-
-## Discovered this run (not fixed — pre-existing, upstream of BC)
-
-- **Tree-walker UAF** at the AST_INDEX_EXPR tail (interpreter.c ~L1091
-  value_free of arr): repro = the 33-output probe under
-  ASAN. `geta(arr)[3]` is the suspected trigger (return-shared value
-  fed to index) but t1–t5 minimal probes were clean — trigger is a
-  subtler shape; bisect the probe file when picking this up.
-  Heap-use-after-free at value_release L171/L195, freed at
-  eval_expression L1092, allocated by make_array_from_list. Reproduces
-  on clean HEAD and with RADS_NO_BC=1 — 100% tree-walker, zero BC
-  involvement.
-- **Sanitize-build stdout swallow**: ASAN builds print banner but no
-  program output (pre-existing at clean HEAD; exit 0, runs fine in -O2).
-  Likely stdio/ASAN init ordering — cosmetic for CI, worth knowing.
+- BEFORE: fib 92.3 / string_build 26.2 / array_churn 10.9 / file_io 21.9.
+- AFTER: fib 90.8 / string_build 25.6 / array_churn 10.5 / file_io 21.5.
+  Flat (noise) — expected: one refcount++ per nested-array index read,
+  and no benchmark reads nested arrays in a hot loop.
 
 ## Next up (single task for next run)
 
-1. **Tree-walker UAF fix** (NEW, discovered this run — highest value):
-   the AST_INDEX_EXPR tail free at interpreter.c ~L1091. Root-cause
-   the share-no-bump quirk vs value_free of the container: when the
-   result shares a nested array pointer with the (about-to-be-freed)
-   container's elem, free order decides UAF vs leak. Fix in the
-   tree-walker FIRST, then mirror the fixed semantics into BC_GETIDX
-   (A/B re-verified). This is a real user-facing memory bug, not perf.
-2. Alternative: fold `if (x <op> imm)` compare-and-branch (BC_CMPF) —
-   fib's `n < 2` runs per call; smaller win.
-3. Alternative: exit-time BcFunc cache free (LSan hygiene).
+1. **BC_CMPF** (journal alternative, now top): fold `if (x <op> imm)`
+   compare-and-branch — fib's `n < 2` runs per call; smaller perf win,
+   well-scoped. Same gauntlet applies.
+2. Exit-time BcFunc cache free (LSan hygiene — shrinks the pre-existing
+   leak report).
+3. `v0_0_7_comprehensive.rads` unsupported syntax — rewrite or implement.
 
-Rules unchanged: compile-bail fallback, suite 7/8 minimum, ASAN clean
-(pre-existing leaks tolerated), `bash benchmarks/run.sh` before/after
-(same session only), A/B with RADS_NO_BC=1, diff BC vs tree-walker
-output on a mixed-type probe (mandatory). If stalled >10 min, fall
-back to AGENTS.md workstream priority.
+Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
+ASAN clean (pre-existing leaks tolerated), `bash benchmarks/run.sh`
+before/after (same session only), A/B with RADS_NO_BC=1, diff BC vs
+tree-walker output on a mixed-type probe (mandatory). If stalled >10 min,
+fall back to AGENTS.md workstream priority.
 
 ## Open blockers
 
-- `git push` still fails: no credentials. **37 commits** now await
+- `git push` still fails: no credentials. **38 commits** now await
   push locally on `phase0/build-recovery` (+1 this run). Needs PAT or
   `gh auth login` by the owner (colyzeo@gmail.com).
 - Main checkout still on dirty `nightshift/20261012-fix-bisect-build`
   with uncommitted stdlib work — untouched, as before.
-- `v0_0_7_comprehensive.rads` unsupported syntax — rewrite or implement.
 - Pre-existing gcc warnings (unused vars/fns) — cosmetic.
 - `.gitignore` line 57 `core` matches `src/core` — tracked files add
   fine, but `git add` of NEW files under src/core needs `-f`.
 - LeakSanitizer pre-existing leaks (AST/parser/csv/env + BcFunc caches)
   — hygiene workstream, not blocking.
+- Sanitize-build stdout swallow (banner only, exit 0) — pre-existing,
+  cosmetic; use a parallel -O2 build for output checks (this run kept
+  `rads-asan` + `rads-o2` side by side in the scratch dir — do that).
+
+## Run log (one line each)
+
+- run 11: BC_GETIDX planned, compile-bail lesson learned.
+- run 12: BC_GETIDX shipped (round 9), 2.1× timing proof, index UAF
+  discovered (pre-existing), 37 commits pending push.
+- run 13: index UAF root-caused (share-no-bump at the tail free) and
+  fixed in tree-walker + BC_GETIDX; regression test added; 38 commits
+  pending push.
