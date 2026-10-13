@@ -1,81 +1,67 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-13 (cron run 13)
+Last updated: 2026-10-13 (cron run 14)
 Branch: `phase0/build-recovery`
-HEAD: see `git log -1` — fix(interp): index-shared nested arrays now bump refcount (UAF)
+HEAD: see `git log -1` — perf(round 10): BC_CMPF fused compare-and-branch
 
 ## What this run changed
 
-**Run 13 = journal "Next up" #1: the tree-walker index UAF, root-caused and
-FIXED, mirrored into BC_GETIDX in lockstep.** One-line semantic change at
-two sites in `src/core/interpreter.c`:
+**Run 14 = journal "Next up" #1: BC_CMPF, shipped.** `if/loop` conditions
+of the shape `local <cmp> int-literal` now compile to a single fused
+compare-and-branch opcode instead of GETL+INT+BIN+JMPF — zero stack traffic,
+no value clone. All changes in `src/core/interpreter.c` (+ regression test):
 
-- Tree-walker `AST_INDEX_EXPR` (eval_expression, ~L1083): the nested-array
-  share path now does `result.array_val->refcount++` after the share.
-- `BC_GETIDX` VM case (~L2486): identical bump — the mirror is exact, so
-  A/B stays bit-identical.
-
-### Root cause (proven, systematic-debugging Phase 1-3 complete)
-
-The index case shared `elem.array_val` with NO refcount bump, then
-`value_free(&arr)` dropped the container. Two detonation shapes,
-both reproduced RED under ASAN on pre-fix binaries, both GREEN after:
-
-- **Shape A (dangling result):** `turbo x = [[1,2],[3,4]][1];` — the
-  outer literal temp has rc=1 and no other owner; the tail free drops it
-  to 0 → items freed → shared inner array freed → `x` dangles. Next read
-  of `x` = UAF (NOBC: `value_clone_impl:130` via `env_list_get:368`;
-  BC: `vm_run:2249`). Note: at -O2 without ASAN this printed a BLANK for
-  `x[0]` — silent wrong output, not just teardown noise.
-- **Shape B (double free at teardown):** `grid[1][0]` chained index — the
-  intermediate `grid[1]` share frees the inner array at rc=1 while
-  `grid`'s item slot still points at it → double release at exit
-  (`value_release:171/174` via `value_free:246`).
-
-Why run 12's t1–t5 probes were "clean": they used single-level named
-arrays — the shared pointer existed but was never touched again, and
-teardown order masked it. The trigger needs a literal-temp container OR
-a chained index whose result outlives the tail free. Journal's
-`geta(arr)[3]` suspicion was wrong (call results go through
-value_clone); probes A/B above are the minimal RED repros.
+- New opcode `BC_CMPF` (enum + handler): imm = u16 slot, u8 op, i64 rhs,
+  u16 absolute jump offset. `bc_try_cmpf()` peeks the condition AST before
+  the generic compile — pure slot lookup (no slot creation), so any
+  non-matching shape falls back to the exact old path unchanged.
+- Emission sites: `AST_IF_STMT` and `AST_LOOP_STMT` (while-form) conditions.
+  The cruise range-loop cond is slot-vs-slot (GETL/GETL/BIN LT/JMPF) — not
+  the literal shape, intentionally left generic.
+- Semantics mirror `binop_apply` + `bc_truthy` exactly: int slot → raw cmp;
+  EQ mixed-type → false (jump); NEQ mixed-type → true (no jump); LT/LTE/
+  GT/GTE on any non-int slot → null → falsy → jump. Skipping the unfused
+  path's clone is observationally identical (the clone was always freed by
+  BC_JMPF; the slot is only read).
 
 ### Verification (mandatory gauntlet, all green)
 
-- **RED→GREEN on probes A/B**: pre-fix ASAN rc=1 with heap-use-after-free
-  (both shapes, BC and NOBC); post-fix rc=0, zero ASAN hits, correct
-  output (`3`/`3`), BC ≡ NOBC.
-- **A/B byte-identical** (md5 `0d726f9a…` match) on a 33-output probe
-  covering: int elems, OOB/negative → null, whole-nested-array reads,
-  chained grid[1][1], string elems, computed idx, arr[arr[0]/10],
-  mixed-type reads incl. nil/bool, loop-indexed, literal-temp chained,
-  share-then-use (shape A), chained named (shape B).
-- **Timing differential (positive compile proof)**: 200×5000 hot loop —
-  BC 0.071s vs NOBC 0.130s = **1.83×** (compile-bail can only tie).
-- **Suite**: pre-fix and post-fix failure lists are IDENTICAL (9 files,
-  all pre-existing on this branch: bisect/http/itertools/math/string/
-  struct/time/v0.0.12/v0_0_7_comprehensive — stdlib tests for the
-  unmerged nightshift work). Zero new regressions. The journal's "7/8"
-  gate is satisfied in spirit: no test that passed before fails now.
-- **New regression test**: `tests/test_index_uaf.rads` (shapes A/B/C/D:
-  literal temp, chained, reassignment churn ×50, triple-nested) — PASS,
-  ASAN-clean, BC ≡ NOBC.
-- Full probe + test_array_uaf.rads + test_index_uaf.rads under ASAN
-  (detect_leaks=0): zero AddressSanitizer hits, BC and NOBC.
+- **A/B byte-identical**: p1 probe (16 outputs: all 6 ops both ways, loop
+  fusion, float/string/null slots, EQ/NEQ mixed, negative + large literals,
+  else-if chains) — BC ≡ NOBC, zero diff. fib.rads BC ≡ NOBC.
+- **ASAN clean** (detect_leaks=0): p1 + p2-hot + regression test, rc=0,
+  zero hits.
+- **Timing differential (positive compile proof, pre-patch vs post-patch
+  binaries, median of 5)**: fib 0.099→0.075s = **1.32×**; compare-heavy
+  probe (5 fused cmps/iter, 200×5000×10) 1.103→0.452s = **2.44×**.
+  (Raw BC-vs-NOBC on the same probe: ~7.9× — all 10 rounds compounded.)
+- **Suite**: failure list IDENTICAL pre/post (9 pre-existing stdlib files:
+  bisect/http/itertools/math/string/struct/time/v0.0.12/v0_0_7_comprehensive).
+  Zero new regressions.
+- **New regression test**: `tests/test_bc_cmpf.rads` (5 shapes: all ops both
+  branches, loop fusion, non-int folds, negative/large literals, nested
+  loops + else-if chains) — PASS, BC ≡ NOBC, ASAN-clean.
+- Full benchmarks (results/20261013T050701Z): fib **90.8→71.0ms**, others
+  flat (string_build 27.1 / array_churn 11.0 / file_io 22.1 — noise).
 
-### Numbers (results/20261013T013352Z baseline / 013704Z after)
+### Method notes (for future rounds)
 
-- BEFORE: fib 92.3 / string_build 26.2 / array_churn 10.9 / file_io 21.9.
-- AFTER: fib 90.8 / string_build 25.6 / array_churn 10.5 / file_io 21.5.
-  Flat (noise) — expected: one refcount++ per nested-array index read,
-  and no benchmark reads nested arrays in a hot loop.
+- Pre/post patch binaries built via `git diff > file; git checkout --; make;
+  cp; git apply; make` — clean isolated differential WITHOUT touching .git
+  internals (stash included; tracked file only).
+- Scratch dir `/home/zari/.hermes/cache/scratch/rads-r14/` held rads-pre,
+  rads-post, rads-asan (parallel builds, per run-13 lesson).
+- RADS grammar notes hit this run: while-spelling is `loop(...)` (the lexer
+  aliases "while"→"loop" but the parser wants `loop`); `turbo f64`/`str`
+  type annotations don't parse — use bare `turbo x = 1.5;`.
 
 ## Next up (single task for next run)
 
-1. **BC_CMPF** (journal alternative, now top): fold `if (x <op> imm)`
-   compare-and-branch — fib's `n < 2` runs per call; smaller perf win,
-   well-scoped. Same gauntlet applies.
-2. Exit-time BcFunc cache free (LSan hygiene — shrinks the pre-existing
-   leak report).
+1. **BC_CMPF for cruise range-loops** (slot-vs-slot variant, `bc_try_cmpf2`):
+   `cruise (i in a..b)` cond is GETL/GETL/BIN(LT)/JMPF — fuse to one opcode
+   (u16 slotA, u16 slotB, u8 op, u16 off) with the same mixed-type folds.
+   Applies to every range loop incl. benchmark harness loops.
+2. Exit-time BcFunc cache free (LSan hygiene).
 3. `v0_0_7_comprehensive.rads` unsupported syntax — rewrite or implement.
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
@@ -86,7 +72,7 @@ fall back to AGENTS.md workstream priority.
 
 ## Open blockers
 
-- `git push` still fails: no credentials. **38 commits** now await
+- `git push` still fails: no credentials. **39 commits** now await
   push locally on `phase0/build-recovery` (+1 this run). Needs PAT or
   `gh auth login` by the owner (colyzeo@gmail.com).
 - Main checkout still on dirty `nightshift/20261012-fix-bisect-build`
@@ -107,4 +93,7 @@ fall back to AGENTS.md workstream priority.
   discovered (pre-existing), 37 commits pending push.
 - run 13: index UAF root-caused (share-no-bump at the tail free) and
   fixed in tree-walker + BC_GETIDX; regression test added; 38 commits
+  pending push.
+- run 14: BC_CMPF shipped (round 10, fused compare-and-branch); fib
+  1.32× / cmp-heavy 2.44× pre-vs-post; regression test added; 39 commits
   pending push.
