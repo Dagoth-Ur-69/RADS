@@ -127,15 +127,19 @@ restored); float spot-check 1+0.5=1.5, sin(π/2)=1.0, cos(π/2)=0.0.
 - NOTE: `git add` of NEW files under `src/core` needs `-f` (.gitignore line 57
   `core` matches the dir; tracked files add fine).
 
-**Next up:** the 9 remaining red tests in `tests/` are all "aspirational
-syntax" files (test_math/string/time/itertools/http/struct/bisect/v0.0.12):
-written for a pythonic surface (`#` comments, `let`, optional semicolons,
-`fn(){}` lambdas, dotted `str.upper`) that the interpreter never had.
-Pick ONE: either (a) implement `#` line comments + `let` alias for `turbo`
-in the lexer/parser (small, high leverage — unlocks 6 of the 9 files to even
-parse), or (b) port the tests to real syntax. Prefer (a); it moves the
-language toward Python-parity readability, which is the mission.
+**Next up (run 17):** continue the pythonic-surface push — **optional
+semicolons**. `test_math.rads` line 7 (`println(...)` without `;`) is the
+next parse blocker; test_string wants paren-free `echo`. Parser change:
+after an expression statement, accept end-of-line as terminator when `;`
+is absent AND the next token starts a new statement (identifier/keyword/
+`}`). Keep `;` fully supported — this is additive, not a swap. Then
+re-run the gauntlet + red files; target: test_math parsing end-to-end.
 
 ## Run log (continued)
+- run 16: `#` line comments + `let` alias shipped (commit e97f80c, pushed
+  to fork). Gauntlet 13/13 (restored missing test_stream.rads — runner
+  had a phantom 12th entry; new test_pythonic_syntax.rads). test_itertools
+  flipped red→green as a side effect. 8 red files remain, all blocked on
+  optional semicolons / paren-free echo / dotted stdlib calls.
 - run 15: nightshift unified into phase0, mixed-float arithmetic fixed,
   45 commits pushed to fork Dagoth-Ur-69/RADS, upstream PR #19 open.
