@@ -135,6 +135,14 @@ is absent AND the next token starts a new statement (identifier/keyword/
 `}`). Keep `;` fully supported — this is additive, not a swap. Then
 re-run the gauntlet + red files; target: test_math parsing end-to-end.
 
+## Session hygiene law (all runs)
+One task per run, then journal + commit + push + END. Context bloat kills
+the loop (run 16 hit 36k tokens, compaction exhausted). Concretely:
+- Cap read_file at 60 lines; prefer `sed -n 'A,Bp'` with tight ranges.
+- No full-suite logs into context — `bash run_tests.sh 2>&1 | tail -5`.
+- One build per run max; verify with 2-3 probe files via `./bin/rads`.
+- If a context-pressure warning appears: STOP work, write journal, end run.
+
 ## Run log (continued)
 - run 16: `#` line comments + `let` alias shipped (commit e97f80c, pushed
   to fork). Gauntlet 13/13 (restored missing test_stream.rads — runner
