@@ -167,6 +167,21 @@ static bool check(Parser* parser, TokenType type) {
     return parser->current.type == type;
 }
 
+// Non-destructive two-token lookahead past `current`: snapshot the lexer
+// (POD: source/start/current/line/column), scan two tokens, restore. Used to
+// disambiguate `Name {` struct literals from a statement block (run 19): the
+// struct-literal parse is only entered when the tokens after `{` match the
+// field shape `identifier ':'` or immediately close the literal (`}`).
+// One token was not enough: `items { n = 1 }` also starts with an identifier.
+static void peek2_next_types(Parser* parser, TokenType* t1, TokenType* t2) {
+    Lexer save = *parser->lexer;
+    Token a = lexer_next_token(parser->lexer);
+    Token b = lexer_next_token(parser->lexer);
+    *parser->lexer = save;
+    *t1 = a.type;
+    *t2 = b.type;
+}
+
 static bool match(Parser* parser, TokenType type) {
     if (!check(parser, type)) return false;
     advance(parser);
@@ -393,7 +408,17 @@ static ASTNode* parse_call(Parser* parser) {
     if (!expr) return NULL; /* propagate parse error instead of dereferencing NULL */
     
     while (true) {
-        if (check(parser, TOKEN_LEFT_BRACE) && expr->type == AST_IDENTIFIER) { // Struct literal
+        if (check(parser, TOKEN_LEFT_BRACE) && expr->type == AST_IDENTIFIER) {
+            // `Name {` is a struct literal ONLY when the tokens after `{`
+            // match the field shape `identifier ':'` or close the literal
+            // (`}`). Otherwise it is a statement block — e.g.
+            // `cruise i in items { n = n + 1; }` (run 19). One token of
+            // lookahead was not enough: `items { n = 1 }` also starts with
+            // an identifier, so we must also see the colon.
+            TokenType after_brace, after_field;
+            peek2_next_types(parser, &after_brace, &after_field);
+            if ((after_brace != TOKEN_IDENTIFIER || after_field != TOKEN_COLON)
+                && after_brace != TOKEN_RIGHT_BRACE) break;
             match(parser, TOKEN_LEFT_BRACE); // consume the brace we checked for
             char* struct_name = expr->identifier.name;
             int line = parser->previous.line;
