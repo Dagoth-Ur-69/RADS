@@ -1,10 +1,51 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-14 (cron run 20)
+Last updated: 2026-10-14 (cron run 21)
 Branch: `phase0/build-recovery`
-HEAD: ea75753 — fix: str() on arrays, arr.append alias, cruise body ambiguity, transpiler print/for rules
+HEAD: a8671bc — feat: Python-style string methods + bare variadic max/min
 
 ## What this run changed
+
+**Run 21 = journal "Next up": run remaining transpiled fixtures + fix red.**
+The fixtures themselves were ALREADY green — all 6 `.rads` outputs
+byte-identical to CPython (`pass=6 fail=0`, `tail -n +4` +
+`grep -v "^Executing:"` normalization; assignments/if_elif_else print
+nothing in CPython too — assert-only). The run's real work was the
+corpse sweep the journal predicted: `"abc".upper()` and bare `max()/min()`
+returned **null, silently** (rc=0, no diagnostic). Four surgical edits:
+
+1. **String-receiver dispatch** (`src/core/interpreter.c`, BOTH eval_call
+   and BC_CALLM): member calls on strings now try `str.%s` natives FIRST,
+   `net.%s` handles second. `str.*` wins on collision by design — string
+   receivers are strings. Was: `net.%s` only → silent-null fallthrough.
+
+2. **`str.upper`/`str.lower` registered** in `src/stdlib/stdlib_string.c`
+   (aliased to existing `stdlib_string_upper/lower` from string_advanced),
+   plus Python names `str.strip` (→trim), `str.starts_with`,
+   `str.ends_with`.
+
+3. **Bare variadic `max`/`min` natives** (`src/stdlib/stdlib_math.c`):
+   `max(3,7)`→7, `max([1,5,3])`→5, returns the winning element AS-IS so
+   mixed int/float keeps the winner's type (`max(2.5,7)`→7 like Python;
+   first draft widened to 7.000000 — caught by probe, fixed). Dotted
+   `math.max`/`math.min` stay strict 2-arg. Empty seq → loud error.
+
+4. Probe bank `/tmp/p1-p3.rads` — 10 corpse probes all live now (upper,
+   lower, strip, max×4 forms, min×2, starts/ends_with).
+
+**Test results:** clean rebuild RC=0; 6/6 fixtures CPython-identical
+post-patch (no regressions); gauntlet **23/23**. Commit a8671bc, pushed
+to fork.
+
+**Next up (run 22):** `elif` chains + f-strings through the transpiler —
+the two named corpses NOT yet verified (transpiler passes method calls
+verbatim, but `elif`/f-string translation rules are unprobed). Probe
+`tools/rads-mask` with a Python file using elif chains + f-strings +
+string-method chains, transpile, run, diff vs CPython. Fallback:
+`docs/stdlib/GAPLIST.md` (Phase 1 #3) — create the Python-module →
+RADS-status map.
+
+## Run 20 (previous)
 
 **Run 20 = journal "Next up": rads-mask triage, but the str(array) hole
 came first (user-flagged) and the triage fell out of it naturally.**
@@ -140,6 +181,11 @@ fall back to AGENTS.md workstream priority.
 
 ## Run log (one line each)
 
+- run 21: silent-null corpses slain — `"abc".upper()` and bare `max/min`
+  returned null with rc=0. String-receiver dispatch (eval_call+BC_CALLM)
+  now tries `str.%s` before `net.%s`; str.upper/lower/strip/starts_with/
+  ends_with registered; bare variadic max/min (winner-as-is typing,
+  max(2.5,7)→7). 6/6 fixtures CPython-identical, gauntlet 23/23. a8671bc.
 - run 20: str(array)="null" + three transpiler corpses slain. (1) shared
   value_to_string serializer — str(x) ≡ echo x for all types; (2)
   arr.append alias in both dispatch sites; (3) parser
