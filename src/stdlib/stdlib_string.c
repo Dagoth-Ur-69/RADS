@@ -718,6 +718,10 @@ void stdlib_string_register(void) {
     register_native("str.join", native_str_join);
     register_native("str.find", native_str_find);
     register_native("str.rfind", native_str_rfind);
+    register_native("str.length", native_str_length);
+    // pythonic 'string.' module aliases -> same natives as 'str.'
+    register_native("string.contains", native_str_contains);
+    register_native("string.length", native_str_length);
     register_native("str.isdigit", native_str_isdigit);
     register_native("str.isalpha", native_str_isalpha);
     register_native("str.isalnum", native_str_isalnum);

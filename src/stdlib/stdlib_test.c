@@ -622,6 +622,15 @@ void stdlib_test_register(void) {
     register_native("test.describe", stdlib_test_describe);
     register_native("test.it", stdlib_test_it);
     register_native("test.expect", stdlib_test_expect);
+    // Bare aliases so chained calls resolve: expect(x).toBe(y) dispatches the
+    // member on a call-result value with the receiver prepended as args[0].
+    register_native("toBe", stdlib_test_toBe);
+    register_native("toEqual", stdlib_test_toEqual);
+    register_native("toBeTruthy", stdlib_test_toBeTruthy);
+    register_native("toBeFalsy", stdlib_test_toBeFalsy);
+    register_native("toBeNull", stdlib_test_toBeNull);
+    register_native("toBeGreaterThan", stdlib_test_toBeGreaterThan);
+    register_native("toBeLessThan", stdlib_test_toBeLessThan);
     register_native("test.toBe", stdlib_test_toBe);
     register_native("test.toEqual", stdlib_test_toEqual);
     register_native("test.toBeTruthy", stdlib_test_toBeTruthy);

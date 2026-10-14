@@ -207,6 +207,36 @@ static ASTNode* parse_declaration(Parser* parser);
 static ASTNode* parse_comparison(Parser* parser);
 static ASTNode* parse_block(Parser* parser);
 
+// Decode C-style escapes in a string literal body (between the quotes).
+// The RADS lexer keeps escapes raw ("a\nb" lexes as 4 chars a,\,n,b) — this
+// turns them into real control characters at parse time, like C/Python/JS.
+// Writes the decoded bytes in-place conceptually; returns a malloc'd string.
+static char* decode_string_escapes(const char* src, size_t len) {
+    char* out = malloc(len + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = src[i];
+        if (c == '\\' && i + 1 < len) {
+            char e = src[++i];
+            switch (e) {
+                case 'n': c = '\n'; break;
+                case 't': c = '\t'; break;
+                case 'r': c = '\r'; break;
+                case '0': c = '\0'; break;
+                case '\\': c = '\\'; break;
+                case '"': c = '"'; break;
+                case '\'': c = '\''; break;
+                case 'e': c = '\033'; break;  // RADS ESC, for ANSI in echo
+                default:  c = e;   break;     // unknown: keep the char itself
+            }
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+    return out;
+}
+
 // Parse primary expressions
 static ASTNode* parse_primary(Parser* parser) {
     if (match(parser, TOKEN_INTEGER)) {
@@ -222,11 +252,9 @@ static ASTNode* parse_primary(Parser* parser) {
     }
     
     if (match(parser, TOKEN_STRING)) {
-        // Remove quotes
+        // Strip quotes and decode escapes (\n, \t, \" ...) into real bytes
         size_t len = parser->previous.length - 2;
-        char* str = malloc(len + 1);
-        memcpy(str, parser->previous.start + 1, len);
-        str[len] = '\0';
+        char* str = decode_string_escapes(parser->previous.start + 1, len);
         ASTNode* node = ast_create_string(str, parser->previous.line, parser->previous.column);
         free(str);
         return node;
@@ -253,9 +281,9 @@ static ASTNode* parse_primary(Parser* parser) {
         return node;
     }
 
-    // Module names that are also type keywords (array, string, etc.)
-    // These can be used as identifiers when followed by '.' for method calls
-    if (match(parser, TOKEN_ARRAY) || match(parser, TOKEN_STR)) {
+    // Module names that are also type keywords (array, str, struct) — usable
+    // as module identifiers for dotted native calls (struct.calcsize, etc.)
+    if (match(parser, TOKEN_ARRAY) || match(parser, TOKEN_STR) || match(parser, TOKEN_STRUCT)) {
         const char* module_name = token_type_to_string(parser->previous.type);
         char* name = strdup(module_name);
         // Convert to lowercase for consistency (STR -> str, ARRAY -> array)
@@ -291,6 +319,42 @@ static ASTNode* parse_primary(Parser* parser) {
         ASTNode* expr = parse_expression(parser);
         consume(parser, TOKEN_RIGHT_PAREN, "Expected ')' after expression");
         return expr;
+    }
+
+    // Anonymous map literal: {"key": value, other: value} — desugared to a
+    // flat [k, v, k, v, ...] array literal, the same object representation
+    // json.parse produces, so every json.* helper accepts it directly.
+    // (A '{' reaching parse_primary is never a block: statement-level '{'
+    // is consumed by parse_statement before any expression is parsed.)
+    if (match(parser, TOKEN_LEFT_BRACE)) {
+        int line = parser->previous.line;
+        int column = parser->previous.column;
+        ASTList* elements = ast_list_create();
+        if (!check(parser, TOKEN_RIGHT_BRACE)) {
+            do {
+                char* key = NULL;
+                if (match(parser, TOKEN_STRING)) {
+                    size_t len = parser->previous.length - 2;
+                    key = decode_string_escapes(parser->previous.start + 1, len);
+                } else if (match(parser, TOKEN_IDENTIFIER)) {
+                    key = malloc(parser->previous.length + 1);
+                    memcpy(key, parser->previous.start, parser->previous.length);
+                    key[parser->previous.length] = '\0';
+                } else {
+                    error(parser, "Expected string or identifier as map key");
+                    return NULL;
+                }
+                ASTNode* key_node = ast_create_string(key, parser->previous.line, parser->previous.column);
+                ast_list_append(elements, key_node);
+                free(key);
+
+                consume(parser, TOKEN_COLON, "Expected ':' after map key");
+                ASTNode* val = parse_expression(parser);
+                if (val) ast_list_append(elements, val);
+            } while (match(parser, TOKEN_COMMA));
+        }
+        consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after map literal");
+        return ast_create_array_literal(elements, line, column);
     }
 
     // Anonymous function: blast(params) { body }

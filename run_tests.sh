@@ -36,6 +36,9 @@ test_files=(
     "test_bisect.rads"
     "test_itertools.rads"
     "test_time.rads"
+    "test_struct.rads"
+    "test_v0.0.12.rads"
+    "test_http.rads"
 )
 
 for test_file in "${test_files[@]}"; do

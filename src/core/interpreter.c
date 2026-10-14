@@ -735,6 +735,28 @@ static Value eval_call(ASTNode* node) {
                 return result;
             }
         }
+        // Chained call on a call result: test.expect(x).toBe(8). The member
+        // ("toBe") is registered as a bare native that receives the receiver
+        // as args[0] followed by the explicit arguments. Must run BEFORE the
+        // receiver is released — on a hit, args[0] takes ownership.
+        if (obj->type != AST_IDENTIFIER && member) {
+            NativeFn chained = find_native(member);
+            if (chained) {
+                int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
+                Value stack_args[9];
+                Value* args = (argc + 1 <= 9) ? stack_args : malloc(sizeof(Value) * (argc + 1));
+                args[0] = obj_val;  // transfer ownership of the receiver
+                for (int i = 0; i < argc; i++) {
+                    args[i + 1] = eval_expression(node->call_expr.arguments->nodes[i]);
+                }
+                Value result = chained(global_interpreter, argc + 1, args);
+                for (int i = 0; i < argc + 1; i++) {
+                    value_free(&args[i]);
+                }
+                if (args != stack_args) free(args);
+                return result;
+            }
+        }
         value_free(&obj_val);
 
         if (obj->type == AST_IDENTIFIER && member) {

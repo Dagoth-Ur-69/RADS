@@ -202,6 +202,9 @@ static TokenType identifier_type(Lexer* lexer) {
                     case '6': return check_keyword(lexer, 2, 1, "4", TOKEN_F64);
                     case 'a': return check_keyword(lexer, 2, 3, "lse", TOKEN_FALSE);
                     case 'i': return check_keyword(lexer, 2, 5, "nally", TOKEN_FINALLY);
+                    case 'n':  // pythonic 'fn' alias -> blast (anonymous fn)
+                        if (lexer->current - lexer->start == 2) return TOKEN_BLAST;
+                        break;
                     case 'o':
                         // pythonic 'for' alias -> cruise
                         if (lexer->current - lexer->start == 3) return check_keyword(lexer, 2, 1, "r", TOKEN_CRUISE);
