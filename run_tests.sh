@@ -27,6 +27,9 @@ test_files=(
     "test_typecheck.rads"
     "test_recursion.rads"
     "test_array_uaf.rads"
+    "test_heapq.rads"
+    "test_logging.rads"
+    "test_statistics.rads"
 )
 
 for test_file in "${test_files[@]}"; do
@@ -56,7 +59,7 @@ echo ""
 echo "======================================"
 echo "Test Summary"
 echo "======================================"
-echo "Total tests: $((${#test_files[@]} - 1))"
+echo "Total tests: $((${#test_files[@]}))"
 echo "Passed: $total_passed"
 echo "Failed: $total_failed"
 echo ""
