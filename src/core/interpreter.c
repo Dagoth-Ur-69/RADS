@@ -75,14 +75,6 @@ Value make_int(long long val) { Value v = { .type = VAL_INT, .int_val = val }; r
 Value make_float(double val) { Value v = { .type = VAL_FLOAT, .float_val = val }; return v; }
 Value make_string(const char* val) { Value v = { .type = VAL_STRING, .string_val = strdup(val) }; return v; }
 
-/* Canonical error return for native modules: say what's wrong in a human
- * voice, then hand back null so the script continues or the caller checks.
- * Extending: add a VAL_ERROR tag someday if scripts need to test for it. */
-Value make_error(const char* msg) {
-    fprintf(stderr, "Error: %s\n", msg);
-    return make_null();
-}
-
 Array* array_create(size_t capacity) {
     Array* arr = malloc(sizeof(Array));
     arr->refcount = 1;
@@ -836,6 +828,10 @@ static Value binop_apply(OperatorType op, Value left, Value right) {
                 result = make_int(left.int_val + right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_float(left.float_val + right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_float((double)left.int_val + right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_float(left.float_val + (double)right.int_val);
             } else if (left.type == VAL_STRING || right.type == VAL_STRING) {
                 // String concatenation with automatic conversion
                 char left_buf[256] = "";
@@ -1043,6 +1039,10 @@ static Value binop_apply(OperatorType op, Value left, Value right) {
                 result = make_bool(left.int_val < right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val < right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val < right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val < (double)right.int_val);
             }
             break;
         case OP_LTE:
@@ -1050,6 +1050,10 @@ static Value binop_apply(OperatorType op, Value left, Value right) {
                 result = make_bool(left.int_val <= right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val <= right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val <= right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val <= (double)right.int_val);
             }
             break;
         case OP_GT:
@@ -1057,6 +1061,10 @@ static Value binop_apply(OperatorType op, Value left, Value right) {
                 result = make_bool(left.int_val > right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val > right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val > right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val > (double)right.int_val);
             }
             break;
         case OP_GTE:
@@ -1064,6 +1072,10 @@ static Value binop_apply(OperatorType op, Value left, Value right) {
                 result = make_bool(left.int_val >= right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val >= right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val >= right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val >= (double)right.int_val);
             }
             break;
         case OP_AND:
