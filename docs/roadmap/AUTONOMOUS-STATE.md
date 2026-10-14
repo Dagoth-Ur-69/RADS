@@ -97,3 +97,45 @@ fall back to AGENTS.md workstream priority.
 - run 14: BC_CMPF shipped (round 10, fused compare-and-branch); fib
   1.32× / cmp-heavy 2.44× pre-vs-post; regression test added; 39 commits
   pending push.
+
+---
+
+## Run 15 — 2026-10-14: unification + first-ever push + PR
+
+**What changed:**
+- Merged `nightshift/20261013-stdlib-float-parity` INTO `phase0/build-recovery`
+  (conflicts resolved: heapq/logging/statistics take the nightshift DOTTED-name
+  versions — `heapq.heapify` style — because the dotted-call resolver builds
+  `module.fn` names; underscore variants could never match. `make_error`
+  duplicate removed).
+- `fix(interp)`: mixed int/float arithmetic completed in `binop_apply` —
+  OP_ADD lacked int+float (1+0.5 → null); OP_LT/LTE/GT/GTE also dropped mixed
+  operands. All widen to double now.
+- `run_tests.sh`: union of both test sets (12 files) + off-by-one total fix.
+
+**Test results:** clean rebuild RC=0; suite 11/11 green (v0_0_7_comprehensive
+restored); float spot-check 1+0.5=1.5, sin(π/2)=1.0, cos(π/2)=0.0.
+
+**PUSH DOCTRINE (new, permanent):**
+- `origin` (zarigata/RADS) is READ-ONLY for this agent (403).
+- Writable remote: `fork` = https://github.com/Dagoth-Ur-69/RADS.git (gh auth:
+  Dagoth-Ur-69, `gh auth setup-git` already done).
+- After committing: `git push fork phase0/build-recovery`. Never force-push.
+- Upstream PRs: `gh pr create --repo zarigata/RADS --head
+  Dagoth-Ur-69:phase0/build-recovery ...` — PR #19 open with runs 1-14 + this.
+- Worktree: `/home/zari/Desktop/RADS-wt-bc`, branch `phase0/build-recovery`.
+- NOTE: `git add` of NEW files under `src/core` needs `-f` (.gitignore line 57
+  `core` matches the dir; tracked files add fine).
+
+**Next up:** the 9 remaining red tests in `tests/` are all "aspirational
+syntax" files (test_math/string/time/itertools/http/struct/bisect/v0.0.12):
+written for a pythonic surface (`#` comments, `let`, optional semicolons,
+`fn(){}` lambdas, dotted `str.upper`) that the interpreter never had.
+Pick ONE: either (a) implement `#` line comments + `let` alias for `turbo`
+in the lexer/parser (small, high leverage — unlocks 6 of the 9 files to even
+parse), or (b) port the tests to real syntax. Prefer (a); it moves the
+language toward Python-parity readability, which is the mission.
+
+## Run log (continued)
+- run 15: nightshift unified into phase0, mixed-float arithmetic fixed,
+  45 commits pushed to fork Dagoth-Ur-69/RADS, upstream PR #19 open.
