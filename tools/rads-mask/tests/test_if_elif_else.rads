@@ -3,23 +3,23 @@
 
 blast sign(x) {
     if (x > 0) {
-        echo("positive");
+        echo(str("positive"));
     } elif (x < 0) {
-        echo("negative");
+        echo(str("negative"));
     } else {
-        echo("zero");
+        echo(str("zero"));
     }
 }
 blast nested(v) {
     if (v == 1) {
         if (v == 1) {
-            echo("one");
+            echo(str("one"));
         } else {
-            echo("inner else");
+            echo(str("inner else"));
         }
     } elif (v == 2) {
-        echo("two");
+        echo(str("two"));
     } else {
-        echo("outer else");
+        echo(str("outer else"));
     }
 }

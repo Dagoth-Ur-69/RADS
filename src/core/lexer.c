@@ -293,20 +293,36 @@ static Token identifier(Lexer* lexer) {
 }
 
 static Token number(Lexer* lexer) {
+    int has_decimal = 0;
     while (isdigit(peek(lexer))) {
         advance(lexer);
     }
     
     // Look for decimal point
     if (peek(lexer) == '.' && isdigit(peek_next(lexer))) {
+        has_decimal = 1;
         advance(lexer); // consume '.'
         while (isdigit(peek(lexer))) {
             advance(lexer);
         }
-        return make_token(lexer, TOKEN_FLOAT);
     }
-    
-    return make_token(lexer, TOKEN_INTEGER);
+
+    // Scientific notation: 1e16, 2.5e-7, 3E+8 (run 22). The parser runs
+    // strtod() over the token text, so it only needs the lexer to CONSUME
+    // the exponent — [eE] [+-]? digits — as part of the float token.
+    if ((peek(lexer) == 'e' || peek(lexer) == 'E')) {
+        char c1 = peek_next(lexer);
+        char c2 = (c1 == '+' || c1 == '-') ? lexer->current[2] : c1;
+        if (isdigit((unsigned char)c2)) {
+            advance(lexer); // consume 'e'/'E'
+            if (peek(lexer) == '+' || peek(lexer) == '-') advance(lexer);
+            while (isdigit(peek(lexer))) advance(lexer);
+            return make_token(lexer, TOKEN_FLOAT);
+        }
+    }
+
+    return has_decimal ? make_token(lexer, TOKEN_FLOAT)
+                       : make_token(lexer, TOKEN_INTEGER);
 }
 
 static Token string(Lexer* lexer) {

@@ -4,7 +4,7 @@
 blast test_while() {
     turbo i = 0;
     loop (i < 5) {
-        echo(i);
+        echo(str(i));
         turbo i = i + 1;
     }
 }
@@ -16,7 +16,7 @@ blast test_for() {
         if (i == 7) {
             break;
         }
-        echo(i);
+        echo(str(i));
     }
 }
 blast sum_array(numbers) {

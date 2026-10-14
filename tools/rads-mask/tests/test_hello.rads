@@ -3,7 +3,7 @@
 
 blast greet(name) {
     turbo message = "Hello, " + name + "!";
-    echo(message);
+    echo(str(message));
     return message;
 }
 turbo result = greet("RADS");
