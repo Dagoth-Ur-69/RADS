@@ -82,6 +82,15 @@ static void skip_whitespace(Lexer* lexer) {
                 lexer->column = 0;
                 advance(lexer);
                 break;
+            case '#':
+                // Pythonic line comment ('#' to end of line), mirroring '//'.
+                // '#' only reaches here outside string literals (the string
+                // scanner consumes those), so CSS hex like "#e74c3c" inside
+                // a string is untouched.
+                while (peek(lexer) != '\n' && !is_at_end(lexer)) {
+                    advance(lexer);
+                }
+                break;
             case '/':
                 if (peek_next(lexer) == '/') {
                     // Line comment
@@ -208,7 +217,14 @@ static TokenType identifier_type(Lexer* lexer) {
                 }
             }
             break;
-        case 'l': return check_keyword(lexer, 1, 3, "oop", TOKEN_LOOP);
+        case 'l':
+            if (lexer->current - lexer->start > 1) {
+                switch (lexer->start[1]) {
+                    case 'e': return check_keyword(lexer, 2, 1, "t", TOKEN_TURBO);
+                    case 'o': return check_keyword(lexer, 2, 2, "op", TOKEN_LOOP);
+                }
+            }
+            break;
         case 'm': return check_keyword(lexer, 1, 3, "ove", TOKEN_MOVE);
         case 'n': return check_keyword(lexer, 1, 3, "ull", TOKEN_NULL);
         case 'p':

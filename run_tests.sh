@@ -20,6 +20,7 @@ fi
 test_files=(
     "test.rads"
     "test_null.rads"
+    "test_pythonic_syntax.rads"
     "test_stream.rads"
     "test_structs.rads"
     "v0_0_7_comprehensive.rads"
