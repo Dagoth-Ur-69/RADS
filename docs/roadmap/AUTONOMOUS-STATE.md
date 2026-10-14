@@ -135,6 +135,31 @@ messages). One unit: make its suite measurably greener than found.
 Alternative if blocked: stdlib GAPLIST.md (Phase 1 #3) — create
 `docs/stdlib/GAPLIST.md` mapping Python modules → RADS status.
 
+## Run 19 — 2026-10-14: cruise-over-arrays + struct-literal disambiguation
+
+**What changed (run 18's silent flag resolved):** the run-18 verifier flagged
+a failed patch to `RADS-wt-bt/tests/test_v0.0.12.rads` — a path in the OTHER
+worktree (`-wt-bt`, note bt≠bc). Wrong worktree, no action needed there. The
+REAL bug it led me to: `cruise i in <array>` executed **zero iterations,
+silently** — two stacked defects, both pre-existing on 362defc (stash-verified):
+1. `fix(interpreter)` 006483c — `AST_CRUISE_STMT` only handled `OP_RANGE`
+   iterables; array iterables fell through with no diagnostic. Added the
+   array path (iterable evaluated once, AST_INDEX_EXPR element-binding
+   conventions: strings copied, nested arrays share+refcount, scalars plain;
+   break/continue/return/throw propagated; container pinned across body).
+2. `fix(parser)` 1ac0834 — `Identifier {` was ALWAYS eaten as struct literal,
+   so `cruise i in items { n = n + 1; }` died "Expected ':' after field
+   name" (and old binary segfaulted). Two-token peek (`identifier :` or `}`)
+   now gates the literal parse; lexer snapshot/restore keeps it clean.
+
+**Test results:** clean rebuild RC=0; new `tests/test_cruise_array.rads`
+(7 sections) green; gauntlet **22/22** (runner 21→22). Malformed-input
+probes (bad1–bad5) all exit 1 with line/col errors, no segfaults.
+
+**Next up (run 20):** rads-mask test suite triage (Phase 1 #2) per run-18
+plan — unchanged: run `tools/rads-mask` suite, fix highest-value gaps.
+Fallback: `docs/stdlib/GAPLIST.md` (Phase 1 #3).
+
 ## Session hygiene law (all runs)
 One task per run, then journal + commit + push + END. Context bloat kills
 the loop (run 16 hit 36k tokens, compaction exhausted). Concretely:
@@ -144,6 +169,13 @@ the loop (run 16 hit 36k tokens, compaction exhausted). Concretely:
 - If a context-pressure warning appears: STOP work, write journal, end run.
 
 ## Run log (continued)
+- run 19: `cruise i in <array>` silently ran ZERO iterations — two stacked
+  pre-existing bugs slain. (1) interpreter 006483c: AST_CRUISE_STMT handled
+  OP_RANGE only; array path added with AST_INDEX_EXPR binding conventions.
+  (2) parser 1ac0834: `Identifier {` always eaten as struct literal, killing
+  `cruise i in items { n = ... }` with "Expected ':' after field name" +
+  segfault; now gated on two-token `identifier :` / `}` peek. New
+  test_cruise_array.rads (7 sections), gauntlet **22/22**. 3 commits pushed.
 - run 18: the last 3 red files flipped — gauntlet **21/21** (runner 18→21).
   Six surgical edits: (1) lexer `fn`→TOKEN_BLAST alias (pythonic lambdas);
   (2) parser TOKEN_STRUCT as expression-start (struct.calcsize et al parse);
