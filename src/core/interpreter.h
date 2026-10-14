@@ -73,6 +73,7 @@ typedef struct Interpreter {
 int interpret(ASTNode* program);
 int interpret_repl_statement(ASTNode* stmt);  // For REPL - executes single statement
 void value_print(Value* value);
+char* value_to_string(Value* value); // malloc'd; caller frees. echo/str() single source of truth
 // Returns a new owning reference to v (strings copied, refcounted values
 // retained). Natives must return owning values — `return args[i];` steals a
 // reference the caller also frees (heap-use-after-free).

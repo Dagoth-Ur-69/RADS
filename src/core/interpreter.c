@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h> /* fmod for float modulo in binary ops */
+#include <stdarg.h> /* va_start/va_copy for strbuf_append (value_to_string) */
 #include <signal.h>
 
 static Value eval_expression(ASTNode* node);
@@ -202,45 +203,88 @@ static void value_release(Value* value) {
     value->type = VAL_NULL;
 }
 
-void value_print(Value* value) {
+// ---------------------------------------------------------------------------
+// value_to_string — serialize any value EXACTLY as `echo` prints it.
+// Single source of truth: value_print (echo) and stdlib str() both route
+// through here, so `echo(str(x))` is always identical to `echo x`.
+// Returns a malloc'd buffer; caller owns it.
+// ---------------------------------------------------------------------------
+typedef struct StrBuf {
+    char* data;
+    size_t len;
+    size_t cap;
+} StrBuf;
+
+static void strbuf_append(StrBuf* b, const char* fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need < 0) { va_end(ap2); return; }
+    if (b->len + (size_t)need + 1 > b->cap) {
+        size_t newcap = b->cap ? b->cap : 64;
+        while (newcap < b->len + (size_t)need + 1) newcap *= 2;
+        char* nd = realloc(b->data, newcap);
+        if (!nd) { va_end(ap2); return; }
+        b->data = nd;
+        b->cap = newcap;
+    }
+    vsnprintf(b->data + b->len, (size_t)need + 1, fmt, ap2);
+    b->len += (size_t)need;
+    va_end(ap2);
+}
+
+static void value_to_string_impl(StrBuf* b, Value* value) {
     switch (value->type) {
-        case VAL_NULL:
-            printf("null");
-            break;
-        case VAL_BOOL:
-            printf("%s", value->bool_val ? "true" : "false");
-            break;
-        case VAL_INT:
-            printf("%lld", value->int_val);
-            break;
-        case VAL_FLOAT:
-            printf("%f", value->float_val);
-            break;
-        case VAL_STRING:
-            printf("%s", value->string_val);
-            break;
+        case VAL_NULL:   strbuf_append(b, "null"); break;
+        case VAL_BOOL:   strbuf_append(b, "%s", value->bool_val ? "true" : "false"); break;
+        case VAL_INT:    strbuf_append(b, "%lld", value->int_val); break;
+        case VAL_FLOAT:  strbuf_append(b, "%f", value->float_val); break;
+        case VAL_STRING: strbuf_append(b, "%s", value->string_val ? value->string_val : ""); break;
         case VAL_ARRAY: {
-            printf("[");
+            strbuf_append(b, "[");
             for (size_t i = 0; i < value->array_val->count; i++) {
-                if (i > 0) printf(", ");
-                value_print(&value->array_val->items[i]);
+                if (i > 0) strbuf_append(b, ", ");
+                value_to_string_impl(b, &value->array_val->items[i]);
             }
-            printf("]");
+            strbuf_append(b, "]");
             break;
         }
         case VAL_FUNCTION:
             if (value->func_node->function_decl.name) {
-                printf("<blast function %s>", value->func_node->function_decl.name);
+                strbuf_append(b, "<blast function %s>", value->func_node->function_decl.name);
             } else {
-                printf("<blast anonymous function>");
+                strbuf_append(b, "<blast anonymous function>");
             }
             break;
         case VAL_STRUCT_DEF:
-            printf("<struct def %s>", value->struct_def->name);
+            strbuf_append(b, "<struct def %s>", value->struct_def->name);
             break;
         case VAL_STRUCT_INSTANCE:
-            printf("<struct instance %s>", value->struct_instance->definition->name);
+            strbuf_append(b, "<struct instance %s>", value->struct_instance->definition->name);
             break;
+        default:
+            strbuf_append(b, "null");
+            break;
+    }
+}
+
+char* value_to_string(Value* value) {
+    StrBuf b = {0};
+    value_to_string_impl(&b, value);
+    if (!b.data) { // empty serialization safety net
+        b.data = malloc(1);
+        if (b.data) b.data[0] = '\0';
+    }
+    return b.data;
+}
+
+void value_print(Value* value) {
+    char* s = value_to_string(value);
+    if (s) {
+        fputs(s, stdout);
+        free(s);
     }
 }
 
@@ -691,8 +735,8 @@ static Value eval_call(ASTNode* node) {
 
         // Array method calls
         if (obj_val.type == VAL_ARRAY && member) {
-            if (strcmp(member, "push") == 0) {
-                // arr.push(value) - add element to end
+            if (strcmp(member, "push") == 0 || strcmp(member, "append") == 0) {
+                // arr.push/append(value) - add element to end (Python alias)
                 int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
                 if (argc > 0) {
                     Value val_to_push = eval_expression(node->call_expr.arguments->nodes[0]);
@@ -2639,7 +2683,7 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 const char* member = f->consts[mem_idx];
 
                 if (obj_val.type == VAL_ARRAY && member) {
-                    if (strcmp(member, "push") == 0) {
+                    if (strcmp(member, "push") == 0 || strcmp(member, "append") == 0) {
                         if (cargc > 0) {
                             array_push(obj_val.array_val, cargs[0]);
                             value_free(&cargs[0]);

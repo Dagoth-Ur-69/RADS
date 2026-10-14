@@ -10,6 +10,7 @@ extern Value make_bool(bool val);
 extern Value make_null(void);
 extern Value value_clone(Value v); // owning-reference helper for natives
 extern Value interpreter_execute_callback(Value callback, int argc, Value* args);
+extern char* value_to_string(Value* value); // interpreter serializer (echo format)
 
 // ANSI Color codes
 #define COLOR_RESET   "\033[0m"
@@ -199,27 +200,9 @@ static bool is_truthy(Value* v) {
     }
 }
 
-// Helper: Value to string
-static char* value_to_string(Value* v) {
-    static char buffer[512];
-    
-    switch (v->type) {
-        case VAL_NULL:
-            return strdup("null");
-        case VAL_BOOL:
-            return strdup(v->bool_val ? "true" : "false");
-        case VAL_INT:
-            snprintf(buffer, sizeof(buffer), "%lld", v->int_val);
-            return strdup(buffer);
-        case VAL_FLOAT:
-            snprintf(buffer, sizeof(buffer), "%g", v->float_val);
-            return strdup(buffer);
-        case VAL_STRING:
-            return strdup(v->string_val);
-        default:
-            return strdup("<value>");
-    }
-}
+// Helper: Value to string — now the interpreter's canonical serializer
+// (echo format); arrays render as [1, 2, 3] in assertion failures too.
+// (The old static 512-byte-buffer helper was replaced by the extern above.)
 
 // test.expect(val).toBe(expected) - Strict equality assertion
 Value stdlib_test_toBe(Interpreter* interp, int argc, Value* args) {
@@ -559,24 +542,13 @@ Value stdlib_test_assert(Interpreter* interp, int argc, Value* args) {
 Value stdlib_test_str(Interpreter* interp, int argc, Value* args) {
     (void)interp;
     if (argc < 1) return make_string("");
-    Value v = args[0];
-    switch (v.type) {
-        case VAL_STRING: return make_string(v.string_val ? v.string_val : "");
-        case VAL_INT: {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%lld", v.int_val);
-            return make_string(buf);
-        }
-        case VAL_FLOAT: {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "%g", v.float_val);
-            return make_string(buf);
-        }
-        case VAL_BOOL:
-            return make_string(v.bool_val ? "true" : "false");
-        default:
-            return make_string("null");
-    }
+    // Route through the interpreter's canonical serializer: str(x) is now
+    // byte-identical to `echo x` for EVERY type — arrays ([1, 2, 3]), nested
+    // arrays, structs, functions, null. Used to return "null" for arrays.
+    char* s = value_to_string(&args[0]);
+    Value out = make_string(s ? s : "");
+    free(s);
+    return out;
 }
 
 // Python-style type(x) — returns the value's type name as a string.

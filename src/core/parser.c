@@ -408,7 +408,8 @@ static ASTNode* parse_call(Parser* parser) {
     if (!expr) return NULL; /* propagate parse error instead of dereferencing NULL */
     
     while (true) {
-        if (check(parser, TOKEN_LEFT_BRACE) && expr->type == AST_IDENTIFIER) {
+        if (check(parser, TOKEN_LEFT_BRACE) && expr->type == AST_IDENTIFIER
+            && !parser->no_struct_literal) {
             // `Name {` is a struct literal ONLY when the tokens after `{`
             // match the field shape `identifier ':'` or close the literal
             // (`}`). Otherwise it is a statement block — e.g.
@@ -712,7 +713,12 @@ static ASTNode* parse_cruise_statement(Parser* parser) {
     
     if (match(parser, TOKEN_IN)) {
         // For-range: cruise (id in iterable)
+        // The `{` that may follow the iterable is ALWAYS the loop body —
+        // suppress struct-literal parsing for this one expression.
+        parser->no_struct_literal = true;
         ASTNode* iterable = parse_expression(parser);
+        parser->no_struct_literal = false;
+        if (!iterable) return NULL; /* propagate parse error */
         if (has_paren) {
             consume(parser, TOKEN_RIGHT_PAREN, "Expected ')' after cruise iterable");
         }

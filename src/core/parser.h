@@ -10,6 +10,8 @@ typedef struct {
     Token previous;
     bool had_error;
     bool panic_mode;
+    bool no_struct_literal; // true while parsing a cruise iterable: `Name {`
+                            // there is ALWAYS the loop body, never a struct literal
 } Parser;
 
 // Parser functions

@@ -258,9 +258,53 @@ static void transpile_line(const char* input, char* output, int* indent_level) {
                 strcpy(collection, in_pos + 4);
                 trim(collection);
 
-                replace_in_line(collection, "range(", "array.range(");
+                /* Python range(...) → RADS native `lo..hi` half-open range.
+                 * (array.range never existed — that mapping emitted a call
+                 * to an undefined function.)
+                 * Supported: range(n) → 0..n, range(a, b) → a..b.
+                 * range(a, b, step) has no RADS equivalent yet → left as-is
+                 * so the interpreter's "Undefined function 'range'" names it. */
+                if (starts_with(collection, "range(")) {
+                    char* rp = collection + 6;
+                    char* rend = strrchr(rp, ')');
+                    if (rend) {
+                        *rend = '\0';
+                        /* count top-level commas to detect the 3-arg form */
+                        int commas = 0, depth = 0, in_str = 0;
+                        for (char* q = rp; *q; q++) {
+                            if (in_str) { if (*q == '"') in_str = 0; }
+                            else if (*q == '"') in_str = 1;
+                            else if (*q == '(' || *q == '[') depth++;
+                            else if (*q == ')' || *q == ']') depth--;
+                            else if (*q == ',' && depth == 0) commas++;
+                        }
+                        char range_buf[MAX_LINE_LENGTH]; // scratch: rp aliases collection
+                        if (commas == 0) {
+                            snprintf(range_buf, sizeof(range_buf), "0..%s", rp);
+                            strcpy(collection, range_buf);
+                        } else if (commas == 1) {
+                            char* c1 = strchr(rp, ',');
+                            *c1 = '\0';
+                            char* lo = rp;
+                            char* hi = c1 + 1;
+                            while (*lo == ' ') lo++;
+                            while (*hi == ' ') hi++;
+                            char* he = hi + strlen(hi) - 1;
+                            while (he > hi && *he == ' ') *he-- = '\0';
+                            snprintf(range_buf, sizeof(range_buf), "%s..%s", lo, hi);
+                            strcpy(collection, range_buf);
+                        }
+                        /* 3-arg range: leave as `range(...)` text; the parse
+                         * error will name it explicitly rather than emit a
+                         * call to the nonexistent array.range */
+                    }
+                }
 
-                sprintf(output + strlen(output), "cruise (%s) { turbo %s;", collection, var);
+                // NOTE: no `turbo var;` here — cruise binds the loop variable
+                // itself; redeclaring with turbo SHADOWS it with null.
+                snprintf(output + strlen(output),
+                         MAX_LINE_LENGTH - strlen(output),
+                         "cruise %s in %s {", var, collection);
                 *indent_level = new_indent + 1;
                 return;
             }
@@ -291,6 +335,73 @@ static void transpile_line(const char* input, char* output, int* indent_level) {
         replace_in_line(rest, "True", "true");
         replace_in_line(rest, "False", "false");
         replace_in_line(rest, "None", "null");
+
+        // Rule 10b: multi-arg print folds into string concatenation.
+        // Python `print(a, b, c)` space-separates; RADS echo takes ONE expr.
+        // → echo(str(a) + " " + str(b) + " " + str(c));
+        // Only fires when rest is exactly "(...)" — anything else (trailing
+        // comment, inline statement) keeps the legacy single-echo path.
+        size_t rlen = strlen(rest);
+        if (rlen >= 2 && rest[0] == '(' && rest[rlen - 1] == ')' && strchr(rest, ',')) {
+            char args_buf[MAX_LINE_LENGTH];
+            strncpy(args_buf, rest + 1, rlen - 2);
+            args_buf[rlen - 2] = '\0';
+
+            // Split on top-level commas (paren/bracket/brace depth + quotes)
+            char* argv[64];
+            int ac = 0, depth = 0, in_str = 0;
+            char quote = 0;
+            char* start = args_buf;
+            char* p;
+            for (p = args_buf; ; p++) {
+                if (*p == '\0') { argv[ac++] = start; break; }
+                if (in_str) {
+                    if (*p == quote) in_str = 0;
+                } else if (*p == '"' || *p == '\'') {
+                    in_str = 1; quote = *p;
+                } else if (*p == '(' || *p == '[' || *p == '{') {
+                    depth++;
+                } else if (*p == ')' || *p == ']' || *p == '}') {
+                    depth--;
+                } else if (*p == ',' && depth == 0) {
+                    *p = '\0';
+                    argv[ac++] = start;
+                    start = p + 1;
+                    if (ac >= 64) { ac = -1; break; } // too many args: bail out
+                }
+            }
+
+            if (ac > 1) {
+                char joined[MAX_LINE_LENGTH * 2];
+                size_t jlen = 0, jcap = sizeof(joined);
+                int overflow = 0;
+                jlen += (size_t)snprintf(joined, jcap, "echo(");
+                for (int i = 0; i < ac && !overflow; i++) {
+                    // trim the arg (leading spaces; trailing cut by ',' NUL)
+                    while (*argv[i] == ' ' || *argv[i] == '\t') argv[i]++;
+                    char* endp = argv[i] + strlen(argv[i]) - 1;
+                    while (endp > argv[i] && (*endp == ' ' || *endp == '\t')) *endp-- = '\0';
+                    if (i > 0)
+                        jlen += (size_t)snprintf(joined + jlen, jcap - jlen, " + \" \" + ");
+                    jlen += (size_t)snprintf(joined + jlen, jcap - jlen, "str(%s)", argv[i]);
+                    if (jlen >= jcap - 1) overflow = 1; // truncated: bail to legacy
+                }
+                if (!overflow) {
+                    snprintf(joined + jlen, jcap - jlen, ");");
+                    // bounded concat: joined can be ~2x MAX_LINE_LENGTH, so
+                    // plain sprintf into output could overflow it
+                    size_t clen = strlen(output);
+                    if (clen + strlen(joined) + 1 <= MAX_LINE_LENGTH) {
+                        strcpy(output + clen, joined);
+                        trim(output);
+                        return;
+                    }
+                    // didn't fit: fall through to legacy echo below
+                }
+                // overflow or weird arg count: fall through to legacy echo
+            }
+        }
+
         sprintf(output + strlen(output), "echo%s;", rest);
         trim(output);
         return;
