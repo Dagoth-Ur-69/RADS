@@ -1,10 +1,61 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-14 (cron run 21)
+Last updated: 2026-10-14 (cron run 22)
 Branch: `phase0/build-recovery`
-HEAD: a8671bc — feat: Python-style string methods + bare variadic max/min
+HEAD: 682eacd — feat: Python-exact str()/print + f-strings + bare len + sci-notation literals
 
 ## What this run changed
+
+**Run 22 = journal "Next up": elif chains + f-strings through the
+transpiler.** Elif chains were already green (rules existed); the probes
+surfaced SEVEN corpses, all now fixed:
+
+1. **`str()`/`print` now have PYTHON semantics, `echo` keeps RADS
+   semantics** (`src/stdlib/stdlib_test.c`): new `py_str_value()`
+   serializer — shortest round-trip float repr (`3.14`, `2.0`,
+   `0.30000000000000004`, `1e-07`, `1e+16`, `1000000000000000.0`),
+   `True`/`False`/`None`, quoted strings inside arrays. This is the
+   key design call: `echo` keeps its `%f` format (zero blast radius on
+   the gauntlet), the transpiler routes `print(x)` → `echo(str(x))`.
+
+2. **Bare `len()`** — string length or array count, loud error otherwise.
+
+3. **`str.startswith`/`str.endswith`** Python spellings registered
+   (aliased to the existing `starts_with`/`ends_with` natives).
+
+4. **`pyfmt.fixed(x, n)`** — Python `{x:.nf}` semantics for f-string
+   specs (also handles int args, inf/nan).
+
+5. **Scientific-notation float literals** (`src/core/lexer.c`):
+   `1e16`, `2.5e-7`, `3E+8` lex as TOKEN_FLOAT (parser strtod already
+   handles them; only consumption was missing).
+
+6. **rads-mask f-string expansion** (`simple_transpiler.c`): `f"..."`
+   → parenthesized RADS concatenation. `{expr}` → `str(expr)`, `{{`/`}}`
+   escapes, `{e:.2f}` → `pyfmt.fixed(e,2)`, `{e:>10}`/`{e:<10}`/`{e:^7}`
+   → `rjust`/`ljust`/`center`, `{e:5d}` → `rjust(5)`. String-literal
+   aware (never expands inside other strings), last-colon spec split.
+
+7. **rads-mask housecleaning**: `import`/`from` lines now DROPPED (the
+   old `import "X.rads"` emitted a load of a nonexistent file — a
+   landmine); `print()` → empty echo; True/False/None mapped with word
+   boundaries + string-awareness (early, before all statement rules).
+
+**Test results:** clean rebuild RC=0; gauntlet **23/23**; 6/6 transpiled
+fixtures byte-identical to CPython; BOTH run-22 probes (elif/str-chains
+34-line + f-string torture 11-print) byte-identical. Commit 682eacd,
+pushed to fork.
+
+**Next up (run 23):** push the probe frontier into **dicts + list
+comprehensions** through the transpiler (`d = {}`, `d[k] = v`,
+`d.get()`, `[x*2 for x in xs]`, `for k in d:`). Dicts are the biggest
+remaining structural gap — RADS has no map type yet (probe first: maybe
+structs/nested arrays can carry it, else plan a proper `hash.rads`/
+VAL_HASH core type). Fallback: `docs/stdlib/GAPLIST.md` (Phase 1 #3).
+
+**Open blockers:** none.
+
+## Run 21 (previous)
 
 **Run 21 = journal "Next up": run remaining transpiled fixtures + fix red.**
 The fixtures themselves were ALREADY green — all 6 `.rads` outputs
