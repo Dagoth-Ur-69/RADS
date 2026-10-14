@@ -1,10 +1,62 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-14 (cron run 17)
+Last updated: 2026-10-14 (cron run 20)
 Branch: `phase0/build-recovery`
-HEAD: see `git log -1` — perf(round 10): BC_CMPF fused compare-and-branch
+HEAD: ea75753 — fix: str() on arrays, arr.append alias, cruise body ambiguity, transpiler print/for rules
 
 ## What this run changed
+
+**Run 20 = journal "Next up": rads-mask triage, but the str(array) hole
+came first (user-flagged) and the triage fell out of it naturally.**
+Theme: transpiled Python now runs green end-to-end. Four stacked fixes:
+
+1. **str(array) returned "null"** — `stdlib_test_str` only handled
+   scalars. Extracted `value_to_string()` from `value_print` (single
+   source of truth, malloc'd buffer, recursive) in
+   `src/core/interpreter.c`; echo AND str() both route through it.
+   `str(x)` is now byte-identical to `echo x` for every type: arrays
+   `[1, 2, 3]`, nested arrays, structs, functions, null. Old static
+   helper in stdlib_test.c (512-byte buf, %g floats) removed —
+   assertion-failure messages render arrays correctly now too.
+   NOTE: str(float) uses %f (3.500000) matching echo, not old %g.
+
+2. **arr.append(x) was "Undefined method"** — dispatch only knew
+   `push`. Added the Python alias in BOTH sites: tree-walker eval_call
+   AND BC_CALLM bytecode handler (`src/core/interpreter.c`).
+
+3. **`cruise w in words {` + empty body** parsed `words { }` as an
+   empty struct literal (run-19 gate accepts `}`), then died on the
+   loop's close brace. New `parser->no_struct_literal` flag
+   (`src/core/parser.c/.h`) suppresses struct-literal parsing for the
+   cruise iterable expression only. Normal struct literals untouched.
+
+4. **rads-mask** (`tools/rads-mask/src/simple_transpiler.c`):
+   - Rule 10b: multi-arg `print(a, b)` → `echo(str(a) + " " + str(b))`,
+     depth-aware comma split (commas in strings/calls/brackets safe).
+   - Rule 7 rewritten: `for x in coll:` → `cruise x in coll {` (was
+     invalid `cruise (coll) { turbo x;` — the `turbo x;` also SHADOWED
+     the loop var with null). `range(n)`→`0..n`, `range(a,b)`→`a..b`
+     native; old `array.range` mapping called a function that never
+     existed anywhere in src/.
+   - Bounded sprintf/snprintf in my touched paths (no new -Wrestrict
+     or format-overflow warnings from run-20 code).
+
+**Test results:** clean rebuild RC=0; gauntlet **23/23** (new
+`tests/test_str_array.rads`, 6 sections, runner 22→23); rads-mask
+transpiled suite green (brace balance + no-leak checks); transpiled
+`test_comprehensive.py` runs end-to-end with Python-identical output
+(Fib table + `Primes: [2, 3, 5, 7, 11]`) — first time EVER green.
+Commit ea75753 (single atomic fix-commit), pushed to fork.
+
+**Next up (run 21):** continue rads-mask triage — run the transpiled
+fixtures for assignments/if_elif_else/loops/functions through
+`./bin/rads` (not just the transpile-text checks) and fix what's red;
+candidate corpses: `elif` chains, `while` translation, string-method
+calls (`"x".upper()`), f-strings. Fallback: `docs/stdlib/GAPLIST.md`
+(Phase 1 #3) — `max`/`min` bare natives are missing (probe hit
+"Undefined function 'max'").
+
+## Session hygiene law (all runs)
 
 **Run 14 = journal "Next up" #1: BC_CMPF, shipped.** `if/loop` conditions
 of the shape `local <cmp> int-literal` now compile to a single fused
@@ -88,6 +140,14 @@ fall back to AGENTS.md workstream priority.
 
 ## Run log (one line each)
 
+- run 20: str(array)="null" + three transpiler corpses slain. (1) shared
+  value_to_string serializer — str(x) ≡ echo x for all types; (2)
+  arr.append alias in both dispatch sites; (3) parser
+  no_struct_literal flag for cruise iterables; (4) rads-mask Rule 10b
+  multi-arg print → str-concat, Rule 7 for-in → `cruise x in coll` +
+  native range mapping (old array.range never existed). Transpiled
+  test_comprehensive.py GREEN end-to-end for the first time
+  (`Primes: [2, 3, 5, 7, 11]`). Gauntlet 23/23. Commit ea75753, pushed.
 - run 11: BC_GETIDX planned, compile-bail lesson learned.
 - run 12: BC_GETIDX shipped (round 9), 2.1× timing proof, index UAF
   discovered (pre-existing), 37 commits pending push.
@@ -155,10 +215,6 @@ silently** — two stacked defects, both pre-existing on 362defc (stash-verified
 **Test results:** clean rebuild RC=0; new `tests/test_cruise_array.rads`
 (7 sections) green; gauntlet **22/22** (runner 21→22). Malformed-input
 probes (bad1–bad5) all exit 1 with line/col errors, no segfaults.
-
-**Next up (run 20):** rads-mask test suite triage (Phase 1 #2) per run-18
-plan — unchanged: run `tools/rads-mask` suite, fix highest-value gaps.
-Fallback: `docs/stdlib/GAPLIST.md` (Phase 1 #3).
 
 ## Session hygiene law (all runs)
 One task per run, then journal + commit + push + END. Context bloat kills
