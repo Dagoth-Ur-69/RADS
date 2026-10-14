@@ -37,6 +37,7 @@ test_files=(
     "test_itertools.rads"
     "test_time.rads"
     "test_struct.rads"
+    "test_cruise_array.rads"
     "test_v0.0.12.rads"
     "test_http.rads"
 )
