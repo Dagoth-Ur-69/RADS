@@ -1577,6 +1577,57 @@ static ExecResult exec_statement(ASTNode* node) {
                         return EXEC_THROW;
                     }
                 }
+                return EXEC_OK;
+            }
+            // Array iteration: `cruise (i in [1,2,3])` / `cruise i in items`.
+            // The iterable is evaluated ONCE (matching the range path above);
+            // element copies follow the AST_INDEX_EXPR conventions: strings
+            // duplicated, nested arrays shared with a refcount bump, scalars
+            // copied plain. Run 19: previously fell through silently — a
+            // non-range iterable produced zero iterations and no diagnostic.
+            if (iter) {
+                Value iterable_v = eval_expression(iter);
+                if (iterable_v.type == VAL_ARRAY && iterable_v.array_val) {
+                    Array* arr = iterable_v.array_val;
+                    arr->refcount++; // keep alive across body mutations/frees
+                    for (size_t j = 0; j < arr->count; j++) {
+                        Value elem = arr->items[j];
+                        Value bound;
+                        if (elem.type == VAL_STRING) {
+                            bound = make_string(elem.string_val);
+                        } else if (elem.type == VAL_ARRAY && elem.array_val) {
+                            // share nested array, bump its refcount (ours)
+                            elem.array_val->refcount++;
+                            bound = elem;
+                        } else {
+                            bound = elem;
+                        }
+                        env_set(node->cruise_stmt.iterator, bound); // env takes ownership
+                        
+                        ExecResult r = exec_statement(node->cruise_stmt.body);
+                        if (r == EXEC_BREAK) {
+                            break;
+                        }
+                        if (r == EXEC_CONTINUE) {
+                            continue;
+                        }
+                        if (r == EXEC_RETURN) {
+                            arr->refcount--;
+                            value_free(&iterable_v);
+                            return EXEC_RETURN;
+                        }
+                        if (r == EXEC_THROW) {
+                            arr->refcount--;
+                            value_free(&iterable_v);
+                            return EXEC_THROW;
+                        }
+                    }
+                    long long rc = --arr->refcount;
+                    (void)rc;
+                    value_free(&iterable_v);
+                } else {
+                    value_free(&iterable_v);
+                }
             }
             return EXEC_OK;
         }
