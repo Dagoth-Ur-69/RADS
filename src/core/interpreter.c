@@ -759,9 +759,16 @@ static Value eval_call(ASTNode* node) {
         }
 
         if (obj_val.type == VAL_STRING && member) {
+            // Python-style method surface first ("x".upper() -> str.upper),
+            // then net-handle methods (server.route et al). str.* wins on
+            // collision by design: string receivers are strings.
             char native_name[64];
-            snprintf(native_name, sizeof(native_name), "net.%s", member);
+            snprintf(native_name, sizeof(native_name), "str.%s", member);
             NativeFn native = find_native(native_name);
+            if (!native) {
+                snprintf(native_name, sizeof(native_name), "net.%s", member);
+                native = find_native(native_name);
+            }
             if (native) {
                 int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
                 Value stack_args[8];
@@ -2704,9 +2711,15 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                     }
                 }
                 if (obj_val.type == VAL_STRING && member) {
+                    // Mirror of eval_call: Python-style str.* surface first,
+                    // net.* handles second.
                     char native_name[64];
-                    snprintf(native_name, sizeof(native_name), "net.%s", member);
+                    snprintf(native_name, sizeof(native_name), "str.%s", member);
                     NativeFn net_native = find_native(native_name);
+                    if (!net_native) {
+                        snprintf(native_name, sizeof(native_name), "net.%s", member);
+                        net_native = find_native(native_name);
+                    }
                     if (net_native) {
                         Value margs[BC_MAX_ARGS + 1];
                         margs[0] = value_clone_impl(obj_val);

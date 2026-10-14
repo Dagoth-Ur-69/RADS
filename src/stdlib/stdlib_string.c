@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stdlib_string.h"
+#include "stdlib_string_advanced.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -730,4 +731,10 @@ void stdlib_string_register(void) {
     register_native("str.center", native_str_center);
     register_native("str.format", native_str_format);
     register_native("str.interpolate", native_str_interpolate);
+    // Python method-name aliases (receiver dispatch "x".m() -> str.m)
+    register_native("str.upper", stdlib_string_upper);
+    register_native("str.lower", stdlib_string_lower);
+    register_native("str.strip", native_str_trim);
+    register_native("str.starts_with", native_str_starts_with);
+    register_native("str.ends_with", native_str_ends_with);
 }
