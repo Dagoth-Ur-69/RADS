@@ -9,7 +9,7 @@ blast test_while() {
     }
 }
 blast test_for() {
-    cruise (array.range(10)) { turbo i;
+    cruise i in 0..10 {
         if (i == 3) {
             continue;
         }
@@ -21,7 +21,7 @@ blast test_for() {
 }
 blast sum_array(numbers) {
     turbo total = 0;
-    cruise (numbers) { turbo num;
+    cruise num in numbers {
         turbo total = total + num;
     }
     return total;
@@ -29,4 +29,4 @@ blast sum_array(numbers) {
 test_while();
 test_for();
 turbo nums = [1, 2, 3, 4, 5];
-echo("Sum:", sum_array(nums));
+echo(str("Sum:") + " " + str(sum_array(nums)));

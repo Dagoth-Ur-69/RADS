@@ -23,16 +23,16 @@ blast is_prime(num) {
 }
 blast filter_primes(numbers) {
     turbo primes = [];
-    cruise (numbers) { turbo num;
+    cruise num in numbers {
         if (is_prime(num)) {
             primes.append(num);
         }
     }
     return primes;
 }
-cruise (array.range(10)) { turbo i;
-    echo("Fib", i, "=", fibonacci(i));
+cruise i in 0..10 {
+    echo(str("Fib") + " " + str(i) + " " + str("=") + " " + str(fibonacci(i)));
 }
 turbo test_numbers = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 turbo primes = filter_primes(test_numbers);
-echo("Primes:", primes);
+echo(str("Primes:") + " " + str(primes));
