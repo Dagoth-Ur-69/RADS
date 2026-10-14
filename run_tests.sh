@@ -31,6 +31,11 @@ test_files=(
     "test_heapq.rads"
     "test_logging.rads"
     "test_statistics.rads"
+    "test_math.rads"
+    "test_string.rads"
+    "test_bisect.rads"
+    "test_itertools.rads"
+    "test_time.rads"
 )
 
 for test_file in "${test_files[@]}"; do

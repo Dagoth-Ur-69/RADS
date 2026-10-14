@@ -182,6 +182,24 @@ static void consume(Parser* parser, TokenType type, const char* message) {
     error_at_current(parser, message);
 }
 
+// Consume the terminator of a statement: ';', or — pythonic style — a
+// newline, '}' or EOF when ';' is absent. Tokens carry line numbers, so a
+// line break between the last consumed token and the current token ends
+// the statement with zero lexer changes. Note the expression parser is
+// greedy across newlines (like ASI): "let x = 1\n-5" parses as 1-5.
+static void consume_statement_end(Parser* parser, const char* message) {
+    if (parser->current.type == TOKEN_SEMICOLON) {
+        advance(parser);
+        return;
+    }
+    if (parser->current.type == TOKEN_EOF ||
+        parser->current.type == TOKEN_RIGHT_BRACE ||
+        parser->current.line > parser->previous.line) {
+        return;  // implicit terminator
+    }
+    error_at_current(parser, message);
+}
+
 // Forward declarations
 static ASTNode* parse_expression(Parser* parser);
 ASTNode* parse_statement(Parser* parser);  // Public for REPL
@@ -311,11 +329,8 @@ static ASTNode* parse_call(Parser* parser) {
     if (!expr) return NULL; /* propagate parse error instead of dereferencing NULL */
     
     while (true) {
-        if (match(parser, TOKEN_LEFT_BRACE)) { // Struct literal
-            if (expr->type != AST_IDENTIFIER) {
-                error(parser, "Expected struct name before '{'");
-                return NULL;
-            }
+        if (check(parser, TOKEN_LEFT_BRACE) && expr->type == AST_IDENTIFIER) { // Struct literal
+            match(parser, TOKEN_LEFT_BRACE); // consume the brace we checked for
             char* struct_name = expr->identifier.name;
             int line = parser->previous.line;
             int column = parser->previous.column;
@@ -529,15 +544,17 @@ static ASTNode* parse_expression(Parser* parser) {
     return parse_assignment(parser);
 }
 
-// Parse echo statement
+// Parse echo statement: echo(expr); or pythonic echo expr
 static ASTNode* parse_echo_statement(Parser* parser) {
     int line = parser->previous.line;
     int column = parser->previous.column;
     
-    consume(parser, TOKEN_LEFT_PAREN, "Expected '(' after 'echo'");
+    bool has_paren = match(parser, TOKEN_LEFT_PAREN);
     ASTNode* expr = parse_expression(parser);
-    consume(parser, TOKEN_RIGHT_PAREN, "Expected ')' after expression");
-    consume(parser, TOKEN_SEMICOLON, "Expected ';' after statement");
+    if (has_paren) {
+        consume(parser, TOKEN_RIGHT_PAREN, "Expected ')' after expression");
+    }
+    consume_statement_end(parser, "Expected ';' after statement");
     
     return ast_create_echo(expr, line, column);
 }
@@ -547,10 +564,13 @@ static ASTNode* parse_return_statement(Parser* parser) {
     int line = parser->previous.line;
     int column = parser->previous.column;
     ASTNode* value = NULL;
-    if (!check(parser, TOKEN_SEMICOLON)) {
+    if (!check(parser, TOKEN_SEMICOLON) &&
+        !check(parser, TOKEN_RIGHT_BRACE) &&
+        !check(parser, TOKEN_EOF) &&
+        parser->current.line <= parser->previous.line) {
         value = parse_expression(parser);
     }
-    consume(parser, TOKEN_SEMICOLON, "Expected ';' after return value");
+    consume_statement_end(parser, "Expected ';' after return value");
     return ast_create_return(value, line, column);
 }
 
@@ -558,7 +578,7 @@ static ASTNode* parse_return_statement(Parser* parser) {
 static ASTNode* parse_await_statement(Parser* parser) {
     (void)parser->previous; // unused for now
     ASTNode* value = parse_expression(parser);
-    consume(parser, TOKEN_SEMICOLON, "Expected ';' after await expression");
+    consume_statement_end(parser, "Expected ';' after await expression");
     // For now, await is a no-op; just evaluate the expression.
     // In the future, we can add async/await semantics.
     return value;
@@ -581,7 +601,7 @@ static ASTNode* parse_loop_statement(Parser* parser) {
 static ASTNode* parse_break_or_continue(Parser* parser, bool is_break) {
     int line = parser->previous.line;
     int column = parser->previous.column;
-    consume(parser, TOKEN_SEMICOLON, "Expected ';' after statement");
+    consume_statement_end(parser, "Expected ';' after statement");
     return is_break ? ast_create_break(line, column) : ast_create_continue(line, column);
 }
 
@@ -591,11 +611,12 @@ static ASTNode* parse_break_or_continue(Parser* parser, bool is_break) {
 static ASTNode* parse_cruise_statement(Parser* parser) {
     int line = parser->previous.line;
     int column = parser->previous.column;
-    consume(parser, TOKEN_LEFT_PAREN, "Expected '(' after 'cruise'");
+    // pythonic: parens optional — `for i in range(...)` or `cruise (i in 0..3)`
+    bool has_paren = match(parser, TOKEN_LEFT_PAREN);
     
     // Check if this is for-range (id in iterable) or C-style for (init; cond; update)
     // Peek at what follows the identifier
-    consume(parser, TOKEN_IDENTIFIER, "Expected variable name after '('");
+    consume(parser, TOKEN_IDENTIFIER, "Expected variable name after 'cruise'");
     char* var_name = malloc(parser->previous.length + 1);
     memcpy(var_name, parser->previous.start, parser->previous.length);
     var_name[parser->previous.length] = '\0';
@@ -603,7 +624,9 @@ static ASTNode* parse_cruise_statement(Parser* parser) {
     if (match(parser, TOKEN_IN)) {
         // For-range: cruise (id in iterable)
         ASTNode* iterable = parse_expression(parser);
-        consume(parser, TOKEN_RIGHT_PAREN, "Expected ')' after cruise iterable");
+        if (has_paren) {
+            consume(parser, TOKEN_RIGHT_PAREN, "Expected ')' after cruise iterable");
+        }
         ASTNode* body = parse_statement(parser);
         ASTNode* cruise = ast_create_cruise(var_name, iterable, body, line, column);
         free(var_name);
@@ -855,7 +878,7 @@ static ASTNode* parse_variable(Parser* parser) {
         initializer = parse_expression(parser);
     }
     
-    consume(parser, TOKEN_SEMICOLON, "Expected ';' after variable declaration");
+    consume_statement_end(parser, "Expected ';' after variable declaration");
     
     ASTNode* node = ast_create_variable_decl(name, type, initializer, is_turbo, line, column);
     if (name) free(name);
@@ -1041,15 +1064,21 @@ static ASTNode* parse_enum_declaration(Parser* parser) {
 
 // Parse declaration
 static ASTNode* parse_declaration(Parser* parser) {
-    // Import statement: import "filename.rads";
+    // Import statement: import "filename.rads"; or pythonic import bisect;
     if (match(parser, TOKEN_IMPORT)) {
         int line = parser->previous.line;
         int column = parser->previous.column;
-        consume(parser, TOKEN_STRING, "Expected filename string after 'import'");
-        char* filename = malloc(parser->previous.length - 1); // -2 for quotes, +1 for null
-        memcpy(filename, parser->previous.start + 1, parser->previous.length - 2);
-        filename[parser->previous.length - 2] = '\0';
-        consume(parser, TOKEN_SEMICOLON, "Expected ';' after import");
+        char* filename;
+        if (match(parser, TOKEN_IDENTIFIER)) {
+            // bare module name, e.g. `import bisect;`
+            filename = strndup(parser->previous.start, parser->previous.length);
+        } else {
+            consume(parser, TOKEN_STRING, "Expected filename string after 'import'");
+            filename = malloc(parser->previous.length - 1); // -2 for quotes, +1 for null
+            memcpy(filename, parser->previous.start + 1, parser->previous.length - 2);
+            filename[parser->previous.length - 2] = '\0';
+        }
+        consume_statement_end(parser, "Expected ';' after import");
         ASTNode* import_node = ast_create_import(filename, line, column);
         free(filename);
         return import_node;
@@ -1208,7 +1237,7 @@ ASTNode* parse_statement(Parser* parser) {
         int line = parser->previous.line;
         int column = parser->previous.column;
         ASTNode* expr = parse_expression(parser);
-        consume(parser, TOKEN_SEMICOLON, "Expected ';' after throw expression");
+        consume_statement_end(parser, "Expected ';' after throw expression");
         return ast_create_throw(expr, line, column);
     }
     
@@ -1230,7 +1259,7 @@ ASTNode* parse_statement(Parser* parser) {
 
     // Expression statement
     ASTNode* expr = parse_expression(parser);
-    consume(parser, TOKEN_SEMICOLON, "Expected ';' after expression");
+    consume_statement_end(parser, "Expected ';' after expression");
     return expr;
 }
 

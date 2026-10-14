@@ -781,7 +781,16 @@ static Value eval_call(ASTNode* node) {
         if (full_name) free(full_name);
     }
     
-    // Fallback for user functions (not fully implemented in this prototype)
+    // Undefined callee: fail loudly. Silent null here makes broken tests
+    // print fake pass marks (the test_time lesson, run 17).
+    if (node->call_expr.callee->type == AST_IDENTIFIER) {
+        fprintf(stderr, "Error: Undefined function '%s'.\n",
+                node->call_expr.callee->identifier.name);
+    } else if (node->call_expr.callee->type == AST_MEMBER_EXPR &&
+               node->call_expr.callee->member_expr.member) {
+        fprintf(stderr, "Error: Undefined method '%s'.\n",
+                node->call_expr.callee->member_expr.member);
+    }
     return make_null();
 }
 
@@ -2808,6 +2817,18 @@ int interpret(ASTNode* program) {
         } else if (decl->type == AST_ENUM_DECL) {
             exec_statement(decl);  // This will call register_enum
         }
+    }
+    
+    // Pass 1.5: Execute top-level statements in source order (pythonic
+    // module semantics). Functions/structs/enums are already registered by
+    // Pass 1, so forward references work; main() (if any) still runs after.
+    for (size_t i = 0; i < program->program.declarations->count; i++) {
+        ASTNode* decl = program->program.declarations->nodes[i];
+        if (decl->type == AST_FUNCTION_DECL || decl->type == AST_STRUCT_DECL ||
+            decl->type == AST_ENUM_DECL || decl->type == AST_IMPORT_STMT) {
+            continue;
+        }
+        exec_statement(decl);
     }
     
     // Pass 2: Execute main function if it exists

@@ -202,6 +202,9 @@ static TokenType identifier_type(Lexer* lexer) {
                     case '6': return check_keyword(lexer, 2, 1, "4", TOKEN_F64);
                     case 'a': return check_keyword(lexer, 2, 3, "lse", TOKEN_FALSE);
                     case 'i': return check_keyword(lexer, 2, 5, "nally", TOKEN_FINALLY);
+                    case 'o':
+                        // pythonic 'for' alias -> cruise
+                        if (lexer->current - lexer->start == 3) return check_keyword(lexer, 2, 1, "r", TOKEN_CRUISE);
                     case 'r': return check_keyword(lexer, 2, 2, "ee", TOKEN_FREE);
                 }
             }
@@ -231,6 +234,11 @@ static TokenType identifier_type(Lexer* lexer) {
             if (lexer->current - lexer->start > 1) {
                 switch (lexer->start[1]) {
                     case 'l': return check_keyword(lexer, 2, 4, "ugin", TOKEN_PLUGIN);
+                    case 'r':
+                        // pythonic print aliases -> echo
+                        if (lexer->current - lexer->start == 5) return check_keyword(lexer, 2, 3, "int", TOKEN_ECHO);
+                        if (lexer->current - lexer->start == 7) return check_keyword(lexer, 2, 5, "intln", TOKEN_ECHO);
+                        break;
                     case 't': return check_keyword(lexer, 2, 1, "r", TOKEN_PTR);
                 }
             }

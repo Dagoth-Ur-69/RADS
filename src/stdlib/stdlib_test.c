@@ -527,7 +527,98 @@ Value stdlib_test_run(Interpreter* interp, int argc, Value* args) {
     return make_int(total_failed == 0 ? 0 : 1);
 }
 
+// Python-style bare assert(cond, msg?) — prints a red FAIL line and returns
+// an int so scripts can check it (0 = pass, 1 = fail). Matches the module's
+// existing natives: stderr on bad usage, make_* returns.
+Value stdlib_test_assert(Interpreter* interp, int argc, Value* args) {
+    (void)interp;
+    if (argc < 1) {
+        fprintf(stderr, "Error: assert() requires a condition\n");
+        return make_int(1);
+    }
+    bool cond = false;
+    switch (args[0].type) {
+        case VAL_BOOL:   cond = args[0].bool_val; break;
+        case VAL_INT:    cond = args[0].int_val != 0; break;
+        case VAL_FLOAT:  cond = args[0].float_val != 0.0; break;
+        case VAL_STRING: cond = args[0].string_val && args[0].string_val[0] != '\0'; break;
+        case VAL_NULL:   cond = false; break;
+        default:         cond = true; break; // arrays/structs/functions: truthy
+    }
+    if (!cond) {
+        if (argc >= 2 && args[1].type == VAL_STRING) {
+            fprintf(stderr, "%sAssertion failed:%s %s\n", COLOR_RED, COLOR_RESET, args[1].string_val);
+        } else {
+            fprintf(stderr, "%sAssertion failed%s\n", COLOR_RED, COLOR_RESET);
+        }
+    }
+    return make_int(cond ? 0 : 1);
+}
+
+// Python-style str(x) — stringify any value (mirror of the + concat coercion).
+Value stdlib_test_str(Interpreter* interp, int argc, Value* args) {
+    (void)interp;
+    if (argc < 1) return make_string("");
+    Value v = args[0];
+    switch (v.type) {
+        case VAL_STRING: return make_string(v.string_val ? v.string_val : "");
+        case VAL_INT: {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%lld", v.int_val);
+            return make_string(buf);
+        }
+        case VAL_FLOAT: {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%g", v.float_val);
+            return make_string(buf);
+        }
+        case VAL_BOOL:
+            return make_string(v.bool_val ? "true" : "false");
+        default:
+            return make_string("null");
+    }
+}
+
+// Python-style type(x) — returns the value's type name as a string.
+Value stdlib_test_type(Interpreter* interp, int argc, Value* args) {
+    (void)interp;
+    if (argc < 1) return make_string("null");
+    switch (args[0].type) {
+        case VAL_INT:    return make_string("integer");
+        case VAL_FLOAT:  return make_string("float");
+        case VAL_STRING: return make_string("string");
+        case VAL_BOOL:   return make_string("bool");
+        case VAL_NULL:   return make_string("null");
+        case VAL_ARRAY:  return make_string("array");
+        case VAL_FUNCTION: return make_string("function");
+        case VAL_STRUCT_DEF: return make_string("struct_def");
+        case VAL_STRUCT_INSTANCE: return make_string("struct");
+        default:         return make_string("unknown");
+    }
+}
+
+// Python-style abs(x) — int/float absolute value.
+Value stdlib_test_abs(Interpreter* interp, int argc, Value* args) {
+    (void)interp;
+    if (argc < 1) return make_int(0);
+    if (args[0].type == VAL_INT) {
+        long long v = args[0].int_val;
+        return make_int(v < 0 ? -v : v);
+    }
+    if (args[0].type == VAL_FLOAT) {
+        double v = args[0].float_val;
+        return make_float(v < 0.0 ? -v : v);
+    }
+    fprintf(stderr, "Error: abs() requires a number\n");
+    return make_int(0);
+}
+
 void stdlib_test_register(void) {
+    // pythonic bare aliases (run 17: test_time needs assert/str/type/abs at top level)
+    register_native("assert", stdlib_test_assert);
+    register_native("str", stdlib_test_str);
+    register_native("type", stdlib_test_type);
+    register_native("abs", stdlib_test_abs);
     register_native("test.describe", stdlib_test_describe);
     register_native("test.it", stdlib_test_it);
     register_native("test.expect", stdlib_test_expect);
