@@ -1,6 +1,6 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-13 (cron run 14)
+Last updated: 2026-10-14 (cron run 17)
 Branch: `phase0/build-recovery`
 HEAD: see `git log -1` — perf(round 10): BC_CMPF fused compare-and-branch
 
@@ -127,13 +127,16 @@ restored); float spot-check 1+0.5=1.5, sin(π/2)=1.0, cos(π/2)=0.0.
 - NOTE: `git add` of NEW files under `src/core` needs `-f` (.gitignore line 57
   `core` matches the dir; tracked files add fine).
 
-**Next up (run 17):** continue the pythonic-surface push — **optional
-semicolons**. `test_math.rads` line 7 (`println(...)` without `;`) is the
-next parse blocker; test_string wants paren-free `echo`. Parser change:
-after an expression statement, accept end-of-line as terminator when `;`
-is absent AND the next token starts a new statement (identifier/keyword/
-`}`). Keep `;` fully supported — this is additive, not a swap. Then
-re-run the gauntlet + red files; target: test_math parsing end-to-end.
+**Next up (run 18):** the remaining 3 red files (test_struct, test_http,
+test_v0.0.12) all block on two features: **`fn() { ... }` lambda syntax**
+(parser: `TOKEN_FN` exists — parse as anonymous function expr, wire to
+ast_create_function or equivalent; test_v0.0.12 uses `test.describe("...", fn() {...})`)
+and **dotted module calls like `struct.calcsize(">i")`** where `struct` is
+NOT a variable (test_struct line 4). eval_call already dispatches dotted
+names via full_name lookup, but the parser's struct-literal rule eats
+`struct.calcsize` — check parse_call's LEFT_BRACE guard interacts OK, the
+blocker is likely in parse_primary/identifier handling of dotted names as
+call callees. Probe each file, fix, wire into run_tests.sh. Target: 21/21.
 
 ## Session hygiene law (all runs)
 One task per run, then journal + commit + push + END. Context bloat kills
@@ -144,6 +147,18 @@ the loop (run 16 hit 36k tokens, compaction exhausted). Concretely:
 - If a context-pressure warning appears: STOP work, write journal, end run.
 
 ## Run log (continued)
+- run 17: pythonic surface round 3 — optional semicolons
+  (consume_statement_end: newline/}/EOF as implicit terminator), paren-free
+  `echo expr` / `for i in iter { ... }`, `print`/`println`→echo and
+  `for`→cruise lexer aliases, bare `import bisect;`, top-level statement
+  execution before main() (module semantics), postfix `{` no longer eats
+  loop bodies, **undefined calls now fail loudly** (test_time was
+  vacuously green — silent null masked every failure), bare natives
+  assert/str/type/abs, stale stdlib/test.rads import removed from
+  test_time. 5 of 8 red files flipped: math/string/bisect/itertools/time
+  all green with real output. Gauntlet 18/18 both BC and NO_BC (runner
+  grew 13→18). Commit 7fade7b, pushed to fork. Remaining red: struct,
+  http, v0.0.12 — blocked on fn() lambdas + dotted struct.* calls (run 18).
 - run 16: `#` line comments + `let` alias shipped (commit e97f80c, pushed
   to fork). Gauntlet 13/13 (restored missing test_stream.rads — runner
   had a phantom 12th entry; new test_pythonic_syntax.rads). test_itertools
