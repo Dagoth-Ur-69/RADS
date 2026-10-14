@@ -127,16 +127,13 @@ restored); float spot-check 1+0.5=1.5, sin(π/2)=1.0, cos(π/2)=0.0.
 - NOTE: `git add` of NEW files under `src/core` needs `-f` (.gitignore line 57
   `core` matches the dir; tracked files add fine).
 
-**Next up (run 18):** the remaining 3 red files (test_struct, test_http,
-test_v0.0.12) all block on two features: **`fn() { ... }` lambda syntax**
-(parser: `TOKEN_FN` exists — parse as anonymous function expr, wire to
-ast_create_function or equivalent; test_v0.0.12 uses `test.describe("...", fn() {...})`)
-and **dotted module calls like `struct.calcsize(">i")`** where `struct` is
-NOT a variable (test_struct line 4). eval_call already dispatches dotted
-names via full_name lookup, but the parser's struct-literal rule eats
-`struct.calcsize` — check parse_call's LEFT_BRACE guard interacts OK, the
-blocker is likely in parse_primary/identifier handling of dotted names as
-call callees. Probe each file, fix, wire into run_tests.sh. Target: 21/21.
+**Next up (run 19):** journal is clean of red files — gauntlet 21/21. Shift
+to Phase 1 workstream #2 per AGENTS.md priority: **rads-mask test suite**.
+`tools/rads-mask` (typed RADS→C transpiler): run its test suite, triage
+failures, fix the highest-value gaps (type annotations, inference, error
+messages). One unit: make its suite measurably greener than found.
+Alternative if blocked: stdlib GAPLIST.md (Phase 1 #3) — create
+`docs/stdlib/GAPLIST.md` mapping Python modules → RADS status.
 
 ## Session hygiene law (all runs)
 One task per run, then journal + commit + push + END. Context bloat kills
@@ -147,6 +144,22 @@ the loop (run 16 hit 36k tokens, compaction exhausted). Concretely:
 - If a context-pressure warning appears: STOP work, write journal, end run.
 
 ## Run log (continued)
+- run 18: the last 3 red files flipped — gauntlet **21/21** (runner 18→21).
+  Six surgical edits: (1) lexer `fn`→TOKEN_BLAST alias (pythonic lambdas);
+  (2) parser TOKEN_STRUCT as expression-start (struct.calcsize et al parse);
+  (3) anonymous `{k:v}` map literals desugar to flat `[k,v,...]` arrays —
+  same shape json.parse emits, so all json.* helpers accept them; (4)
+  receiver-prepend dispatch in eval_call for chained calls on call results
+  (test.expect(x).toBe(8)); (5) registered str.length + string.* aliases +
+  bare toBe/toEqual/toBeTruthy/… matcher natives; (6) **string escape
+  decoding at parse time** (`\n` `\t` `\r` `\"` `\\` `\e`) — the hidden
+  root cause: raw `\"` poisoned every embedded-JSON literal, silently
+  yielding empty objects (json.parse returned `[]` for 10/50 v0.0.12
+  tests). test_v0.0.12's pretty-printer assert updated to decoded
+  semantics. 50/50 in-suite, test_http green end-to-end over live
+  httpbin.org, test_struct green. Clean rebuild + 21/21. Commit 27c1f10,
+  pushed to fork. NOTE: pre-existing -Wimplicit-fallthrough warning in
+  lexer.c `for`→cruise case (run 17 code) — left alone, no drive-bys.
 - run 17: pythonic surface round 3 — optional semicolons
   (consume_statement_end: newline/}/EOF as implicit terminator), paren-free
   `echo expr` / `for i in iter { ... }`, `print`/`println`→echo and
