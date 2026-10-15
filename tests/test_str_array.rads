@@ -15,12 +15,12 @@ turbo p = [1, 2, 3];
 let s = str(p);
 check(s == "[1, 2, 3]", "str([1,2,3]) should be '[1, 2, 3]', got: " + s);
 
-// --- 2. str() scalars + nested ---
+// --- 2. str() scalars + nested (Python-exact reprs, run 22) ---
 check(str(42) == "42", "str(int)");
-check(str(true) == "true", "str(bool)");
-check(str(null) == "null", "str(null)");
+check(str(true) == "True", "str(bool)");
+check(str(null) == "None", "str(null)");
 turbo nested = [1, [2, 3], "four"];
-check(str(nested) == "[1, [2, 3], four]", "str(nested array)");
+check(str(nested) == "[1, [2, 3], 'four']", "str(nested array)");
 
 // --- 3. append alias (was: Undefined method 'append') ---
 turbo a = [];

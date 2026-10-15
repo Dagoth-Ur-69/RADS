@@ -58,7 +58,8 @@ for test_file in "${test_files[@]}"; do
     echo "Running: $test_file"
     echo "─────────────────────────────────────────"
 
-    if $RADS_BIN "$test_path" > /tmp/rads_test_output.txt 2>&1; then
+    if $RADS_BIN "$test_path" > /tmp/rads_test_output.txt 2>&1 \
+       && ! grep -q "Assertion failed" /tmp/rads_test_output.txt; then
         echo "✓ $test_file PASSED"
         ((total_passed++))
     else
