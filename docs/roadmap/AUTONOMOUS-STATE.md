@@ -1,78 +1,75 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 28)
+Last updated: 2026-10-15 (cron run 29)
 Branch: `phase0/build-recovery`
-HEAD: 30d3a9c — fix(memory): struct-literal orphan leak + uninit definition crashes
+HEAD: f051c04 — fix(memory): stdlib_struct leak sweep (push-then-free)
 
 ## What this run changed
 
-**Run 28 = journal "Next up": the struct-literal orphan leak.** Dead — and,
-continuing the house tradition, the one journalled leak was four stacked
-corpses in the same ownership class. LSan differential on an identical
-probe (struct decl + 2 literals + enum + member access + str()): **script
-mode 172 B / 8 allocs → 0 / 0**; REPL mode 0 leaks, output correct.
+**Run 29 = journal "Next up": the stdlib_struct.c leak sweep.** Dead.
+Scratch-first (rads-r29/build): repro'd exactly 146 B / 7 allocs on
+test_struct.rads, mapped ownership with minimal probes, applied the
+Run 23 json precedent (`array_push` then `value_free`) at **4 sites**,
+then ported the identical patch to the worktree.
 
-1. **Per-literal StructDef orphan** (`interpreter.c:1609`): literal eval
-   malloc'd a fresh StructDef + strdup'd the name per literal; clones
-   share the pointer so value_release can never free it — orphaned
-   ~19 B per literal forever. The registry binding now owns the ONE
-   canonical StructDef (`def.name` aliases `binding->name`, freed once
-   with the binding); literals and clones BORROW it. find_struct →
-   find_struct_def returning `StructDef*`.
+1. Root cause: `array_push` stores `value_clone_impl(v)` — refcount++
+   for arrays, strdup for strings — so `array_push(arr, f())` orphans
+   f()'s return. Sites fixed in `src/stdlib/stdlib_struct.c`:
+   - `:375` unpack — parse_value temp per field
+   - `:496` unpack_from — same
+   - `:545` iter_unpack inner — parse_value temp per field
+   - `:551` iter_unpack outer — `array_push(outer, inner_val)` clone
+     never released (the 96 B direct + 48 B indirect journalled leak)
+   - `:91` (pack) deliberately untouched: ints only, bitwise clone.
+2. Pattern per site: `Value pv = parse_value(...); array_push(arr, pv);
+   value_free(&pv);` — `value_free` (interpreter.h:83) is public;
+   `value_release` is static to interpreter.c, unusable from stdlib.
 
-2. **Parser identifier orphan** (`parser.c` parse_call): the struct-
-   literal branch overwrote `expr` (the leading identifier node, 64 B +
-   3 B name) without freeing it — one orphan per literal SITE, every
-   parse, REPL and script alike. Now creates the literal first, then
-   ast_free(expr) — order matters: `struct_name` aliases
-   `expr->identifier.name`, which ast_free releases.
+## Test results (run 29)
 
-3. **Uninitialized `definition` → live SEGV** (4 stdlib creators):
-   datetime.now / csv parse rows / cli.run result / env.vars built
-   StructInstances and NEVER set `definition` — `echo str(datetime.now())`
-   dereferenced 0xbebebebebebebebe (UBSAN misaligned + ASAN SEGV,
-   reproduced on the pre-fix build). All four now set definition = NULL;
-   the two unguarded readers (value_to_string, member-error message)
-   label NULL defs "native". pprint already guarded. (Same corpse class
-   as run 26's regex.search fix — sweep was overdue.)
-
-4. **Script-mode registry leak** (`interpret()` tail): ended with
-   env_free() only — struct AND enum registry bindings (name strdup +
-   binding) leaked every script run as still-reachable globals LSan
-   doesn't flag by default. Teardown added: env_free → env_free_structs
-   → env_free_enums (registry after env so value_release never touches
-   a freed canonical def; same order as the REPL exit path). interpret()
-   has exactly one caller (main.c:584), so self-cleaning is safe.
-
-## Test results (run 28)
-
-Clean rebuild (plain), gauntlet **26/26 + REPL regression gate** green.
-Sanitize build: probe 0 leaks both modes; datetime.now() repro now exits
-0 printing `<struct instance native>`. Pushed to fork: `6b21627..30d3a9c`.
+Scratch validation: probes p1/p2/p3 (iter_unpack, unpack ">c")
+**146 B/7 → 0/0** under LSan, full test_struct 0 leaks rc=0, REPL mode
+clean, A/B `RADS_NO_BC=1` vs BC **byte-identical** (ab.rads:
+pack/unpack ">iHbc", iter_unpack "<h", ">bB", ">c" from string).
+Worktree: clean rebuild + gauntlet **26/26** green. Pushed to fork:
+`0a861cb..f051c04`.
 
 ## Known hazards (noted, not fixed — pre-existing)
 
-- **stdlib_struct.c pack/unpack internals leak 146 B / 7 allocs** on
-  test_struct.rads under LSan (iter_unpack arrays 96 B + 48 B indirect,
-  parse_value strdup) — NOT touched this run; next up.
-- **REPL `import` sub-AST never freed**: exec_statement's import case
-  parses the imported file and never ast_free(imported_ast) — same in
-  script mode, pre-existing.
+- **REPL/script `import` sub-AST never freed** (probed this run, run 29
+  build): `import "lib.rads"` leaks 152 B / 3 allocs — `ast_create_program`
+  at interpreter.c:1790 (exec_statement import case) parses the module
+  and never `ast_free`s it. **Next up.**
 - `turbo i32 c = GREEN;` echoes null — enum member resolution
   semantics, identical in script mode; not a REPL regression.
-- Native-return values leak engine-wide (run 25 baseline class) —
-  documented, tolerated.
+- Native-return values leak engine-wide (run 25 baseline class; includes
+  `str.split` tokens) — documented, tolerated.
 
 ## Next up (single task for next run)
 
-1. **stdlib_struct.c leak sweep**: the 146 B / 7 alloc residue on
-   test_struct.rads (iter_unpack array_create + parse_value strdup
-   paths). Same method as this run: LSan differential before/after,
-   both modes, ownership mapped before freeing.
+1. **import sub-AST leak**: exec_statement's import case
+   (interpreter.c:~1790) — `ast_free` the imported module's Program AST
+   after execution. Same method: LSan differential before/after, both
+   modes, ownership mapped before freeing (top-level func decls may be
+   registered by reference — verify ast_free safety first).
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
 vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 28 (previous run — summary retained below)
+
+Struct-literal orphan leak — turned out four stacked corpses in one
+class: (1) per-literal StructDef orphan (interpreter.c:1609) — registry
+binding now owns the ONE canonical def, literals/clones borrow;
+(2) parser identifier orphan in parse_call — free expr after creating
+the literal (name aliases expr's name); (3) 4 stdlib creators
+(datetime.now/csv/cli.run/env.vars) left StructInstance->definition
+uninitialized — live SEGV on 0xbebebebebebebebe, all NULL-init'd,
+unguarded readers label NULL "native"; (4) script-mode struct+enum
+registry leak — interpret() tail now env_free → env_free_structs →
+env_free_enums. LSan script 172 B/8 → 0/0; gauntlet 26/26.
+Commits 30d3a9c + 0a861cb on fork.
 
 ## Run 27 (previous run — summary retained below)
 
