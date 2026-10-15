@@ -72,6 +72,46 @@ done
 
 echo ""
 echo "======================================"
+echo "REPL Regression (run 27)"
+echo "======================================"
+
+# Run 27: the REPL must register blast/struct/enum lines and keep their ASTs
+# alive (per-line arena). Old bug: functions never registered ("Undefined
+# function"), and after registration the per-line ast_free dangled func_node.
+repl_probe="$TMPDIR/rads_repl_probe.txt"
+if [ -z "$TMPDIR" ]; then repl_probe="/tmp/rads_repl_probe.txt"; fi
+cat > "$repl_probe" <<'EOF'
+struct Pt { str tag; i32 n; }
+blast mk(t) { return Pt { tag: t, n: 7 }; }
+blast add(a, b) { return a + b; }
+echo add(2, 3);
+turbo Pt p = mk("arena");
+echo p.tag;
+blast fib(n) { if (n < 2) { return n; } return fib(n-1) + fib(n-2); }
+echo fib(15);
+.exit
+EOF
+repl_out="$($RADS_BIN < "$repl_probe" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+repl_ok=1
+for expected in "5" "arena" "610"; do
+    if ! echo "$repl_out" | grep -qx "$expected"; then
+        echo "✗ REPL output missing '$expected'"
+        repl_ok=0
+    fi
+done
+if echo "$repl_out" | grep -q "Undefined function"; then
+    echo "✗ REPL failed to register blast function"
+    repl_ok=0
+fi
+if [ $repl_ok -eq 1 ]; then
+    echo "✓ REPL function/struct registration PASSED"
+else
+    echo "$repl_out" | grep -v "^rads\[" | tail -20
+    ((total_failed++))
+fi
+
+echo ""
+echo "======================================"
 echo "Test Summary"
 echo "======================================"
 echo "Total tests: $((${#test_files[@]}))"
