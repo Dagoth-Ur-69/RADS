@@ -1,10 +1,77 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 29)
+Last updated: 2026-10-15 (cron run 30)
 Branch: `phase0/build-recovery`
-HEAD: f051c04 — fix(memory): stdlib_struct leak sweep (push-then-free)
+HEAD: b09ec8a — fix(memory): imported program ASTs freed at teardown
 
 ## What this run changed
+
+**Run 30 = journal "Next up": the import sub-AST leak.** Dead.
+Scratch-first (rads-r30/build): baseline reproduced exactly —
+`import "lib.rads"` leaked 152 B / 3 allocs at `ast_create_program`
+(interpreter.c:1790, exec_statement import case).
+
+1. Ownership audit BEFORE freeing (per run-29's warning): every
+   registration derived from an imported tree is a **borrowed**
+   ASTNode* — env function values hold `func_node`, struct/enum
+   bindings hold `node`; `value_release` never touches `func_node`
+   (VAL_FUNCTION hits `default: break`), and `env_free_structs` /
+   `env_free_enums` free only their binding shells ("The AST node is
+   owned by the main AST"). Freeing at import completion would
+   dangle every imported function still callable in the script.
+2. Fix: growable side registry (`parked_imports`, doubling from 8,
+   OOM-safe `parked_imports_add`) parks each parsed AST_PROGRAM at
+   import time; `parked_imports_free()` runs at teardown **after**
+   `env_free/env_free_structs/env_free_enums` drop all borrowers —
+   in BOTH the script-mode `interpret()` tail and
+   `interpreter_cleanup_environment()` (REPL exit). Failed-parse
+   partial trees (no borrowers yet) freed immediately in the
+   `parser.had_error` branch (verified leak-clean by a
+   garbage-syntax import probe).
+3. Validated in scratch, then the identical 79-line patch applied
+   clean to the worktree (`git apply --check` first).
+
+## Test results (run 30)
+
+Scratch (ASan/LSan build): p1.rads **152 B/3 → 0/0**; duplicate
+imports + imported struct + method-call-after-import stress probe
+0/0 with correct output; failed-parse import 0/0; bytecode A/B
+(`RADS_NO_BC=1` vs BC) **byte-identical**. REPL import probe:
+285 B/6 → 133 B/3 — the import component is dead; residue is a
+**pre-existing** REPL statement-AST leak (parser.c `parse_call` /
+`ast_create_binary_op` path), A/B-verified against a stashed clean
+build. Worktree: clean rebuild + gauntlet **26/26** green. Pushed
+to fork: `004ce40..b09ec8a`.
+
+## Known hazards (noted, not fixed — pre-existing)
+
+- **REPL statement-AST leak** (found this run): 133 B / 3 per REPL
+  line like `echo add(1,2);` — statement ASTs from
+  `interpret_repl_statement` never freed at exit (alloc sites:
+  `ast_create_binary_op` ast.c:107, `ast_create_identifier`
+  ast.c:98/102 via parser parse_call). **Next up.**
+- `make sanitize -j` destroys the build tree (clean + order-only
+  dirs race under -j) — build sanitize serially; Makefile hazard
+  worth a dedicated fix run.
+- `turbo i32 c = GREEN;` echoes null — enum member resolution
+  semantics, identical in script mode; not a REPL regression.
+- Native-return values leak engine-wide (run 25 baseline class;
+  includes `str.split` tokens) — documented, tolerated.
+
+## Next up (single task for next run)
+
+1. **REPL statement-AST leak**: `interpret_repl_statement` /
+   main.c REPL loop — statement ASTs parsed per line are never
+   freed at REPL exit (133 B / 3 per line, alloc sites above).
+   Same method: scratch-first LSan differential, ownership mapped
+   (REPL env values may borrow into the statement trees — audit
+   before freeing), both modes, A/B bytecode.
+
+Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
+ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
+vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 29 (previous run — summary retained below)
 
 **Run 29 = journal "Next up": the stdlib_struct.c leak sweep.** Dead.
 Scratch-first (rads-r29/build): repro'd exactly 146 B / 7 allocs on
@@ -444,6 +511,14 @@ fall back to AGENTS.md workstream priority.
 
 ## Run log (one line each)
 
+- run 30: import sub-AST leak slain — imported programs' AST_PROGRAMs
+  were parsed+executed but never freed (152 B/3 per import). Ownership
+  audit showed all registrations borrowed (func_node/node); fix parks
+  trees in a growable registry freed at teardown after env_free, both
+  script and REPL paths + immediate free on failed parse. Scratch LSan
+  152/3→0/0, stress (dup imports, struct, method calls) 0/0, BC A/B
+  identical, gauntlet 26/26. Found next leak: REPL statement ASTs
+  (133 B/3 per line). b09ec8a on fork.
 - run 27: REPL ownership class slain — the journal's dangling func_node was
   buried under TWO layers: functions never registered at all (no
   AST_FUNCTION_DECL case in exec_statement) and struct/enum lines never
