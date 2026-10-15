@@ -19,6 +19,40 @@ uv_loop_t* global_event_loop = NULL;
 static struct Interpreter global_interpreter_instance = {0};
 static struct Interpreter* global_interpreter = NULL;
 
+// Run 30: imported programs outlive import execution — every registration
+// derived from them (env function values hold func_node, struct/enum
+// bindings hold node) is a BORROWED ASTNode*. Freeing at import completion
+// would dangle every imported function still callable in the script. So the
+// parsed AST_PROGRAM is parked here and freed at teardown, AFTER env_free()
+// has dropped all borrowers. Mirrors the run-27/28 teardown-arena pattern.
+static ASTNode** parked_imports = NULL;
+static size_t parked_import_count = 0;
+static size_t parked_import_capacity = 0;
+
+static void parked_imports_free(void) {
+    for (size_t i = 0; i < parked_import_count; i++) {
+        ast_free(parked_imports[i]);
+    }
+    free(parked_imports);
+    parked_imports = NULL;
+    parked_import_count = 0;
+    parked_import_capacity = 0;
+}
+
+// Returns true if the program was parked (ownership transferred); false if
+// the caller must handle the node itself.
+static bool parked_imports_add(ASTNode* program) {
+    if (parked_import_count == parked_import_capacity) {
+        size_t cap = parked_import_capacity ? parked_import_capacity * 2 : 8;
+        ASTNode** grown = realloc(parked_imports, cap * sizeof(ASTNode*));
+        if (!grown) return false; // OOM: leave node parked-nowhere; caller keeps old (leak, not crash)
+        parked_imports = grown;
+        parked_import_capacity = cap;
+    }
+    parked_imports[parked_import_count++] = program;
+    return true;
+}
+
 static void handle_sigint(int signo) {
     (void)signo;
     if (global_event_loop) {
@@ -1791,6 +1825,9 @@ static ExecResult exec_statement(ASTNode* node) {
             free(source);
 
             if (imported_ast && imported_ast->type == AST_PROGRAM && !parser.had_error) {
+                // Run 30: park the parsed program — see parked_imports. All
+                // registrations made below are borrowed pointers into this tree.
+                parked_imports_add(imported_ast);
                 // Execute all declarations in the imported file
                 for (size_t i = 0; i < imported_ast->program.declarations->count; i++) {
                     ASTNode* decl = imported_ast->program.declarations->nodes[i];
@@ -1802,6 +1839,9 @@ static ExecResult exec_statement(ASTNode* node) {
                 }
             } else if (parser.had_error) {
                 fprintf(stderr, "Error: Failed to parse imported file '%s'\n", filename);
+                // Run 30: partial tree from a failed parse was never parked nor
+                // registered — free it now (no borrowers exist yet).
+                if (imported_ast) ast_free(imported_ast);
             }
 
             return EXEC_OK;
@@ -3528,6 +3568,7 @@ int interpret(ASTNode* program) {
     env_free();
     env_free_structs();
     env_free_enums();
+    parked_imports_free(); // Run 30: ASTs outlive all env borrowers; free last
     interpreter_cleanup_event_loop();
     return 0;
 }
@@ -3560,4 +3601,5 @@ void interpreter_cleanup_environment(void) {
     env_free();
     env_free_structs();
     env_free_enums();
+    parked_imports_free(); // Run 30: imported ASTs freed after all borrowers
 }
