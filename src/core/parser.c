@@ -550,7 +550,14 @@ static ASTNode* parse_call(Parser* parser) {
             }
             consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after struct literal");
 
-            expr = ast_create_struct_literal(struct_name, fields, line, column);
+            // Run 28: the identifier node's work is done (its name was copied
+            // into the literal by the strdup above). Free it — the old code
+            // just overwrote `expr`, orphaning one AST node per literal site,
+            // every parse, forever. NOTE: create BEFORE freeing — struct_name
+            // aliases expr->identifier.name, which ast_free releases.
+            ASTNode* lit = ast_create_struct_literal(struct_name, fields, line, column);
+            ast_free(expr);
+            expr = lit;
 
         } else if (match(parser, TOKEN_LEFT_PAREN)) {
             ASTList* args = ast_list_create();

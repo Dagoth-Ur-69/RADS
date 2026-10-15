@@ -368,7 +368,12 @@ static void value_to_string_impl(StrBuf* b, Value* value) {
             strbuf_append(b, "<struct def %s>", value->struct_def->name);
             break;
         case VAL_STRUCT_INSTANCE:
-            strbuf_append(b, "<struct instance %s>", value->struct_instance->definition->name);
+            // Run 28: native creators (datetime/csv/cli/env) set definition to
+            // NULL — label them instead of dereferencing uninit memory.
+            strbuf_append(b, "<struct instance %s>",
+                          value->struct_instance->definition && value->struct_instance->definition->name
+                              ? value->struct_instance->definition->name
+                              : "native");
             break;
         default:
             strbuf_append(b, "null");
@@ -683,10 +688,17 @@ static NativeFn find_native(const char* name) {
     return NULL;
 }
 
-// Struct definition registry
+// Struct definition registry.
+// Run 28 ownership law: the binding owns the ONE canonical StructDef for the
+// name (def.name aliases binding->name, freed once below; def.ast_node is
+// borrowed from the main AST). Struct literals and clones BORROW the pointer —
+// value_release never frees definition, so no double-free; the registry
+// outlives every instance in both script and REPL modes (env_free runs before
+// registry teardown in each path).
 typedef struct StructDefBinding {
     char* name;
     ASTNode* node;
+    StructDef def; // canonical, registry-owned
     struct StructDefBinding* next;
 } StructDefBinding;
 
@@ -696,15 +708,17 @@ static void register_struct(const char* name, ASTNode* node) {
     StructDefBinding* binding = malloc(sizeof(StructDefBinding));
     binding->name = strdup(name);
     binding->node = node;
+    binding->def.name = binding->name; // alias: freed once, with the binding
+    binding->def.ast_node = node;
     binding->next = struct_definitions;
     struct_definitions = binding;
 }
 
-static ASTNode* find_struct(const char* name) {
+static StructDef* find_struct_def(const char* name) {
     StructDefBinding* current = struct_definitions;
     while (current) {
         if (strcmp(current->name, name) == 0) {
-            return current->node;
+            return &current->def;
         }
         current = current->next;
     }
@@ -1512,7 +1526,11 @@ static Value eval_expression(ASTNode* node) {
                     }
                     current = current->next;
                 }
-                fprintf(stderr, "Error: Struct '%s' has no member '%s'.\n", object.struct_instance->definition->name, member_name);
+                const char* def_name =
+                    object.struct_instance->definition && object.struct_instance->definition->name
+                        ? object.struct_instance->definition->name
+                        : "native";
+                fprintf(stderr, "Error: Struct '%s' has no member '%s'.\n", def_name, member_name);
             } else if (object.type == VAL_ARRAY) {
                 const char* member_name = node->member_expr.member;
                 if (strcmp(member_name, "length") == 0) {
@@ -1599,16 +1617,18 @@ static Value eval_expression(ASTNode* node) {
             return env_get(node->identifier.name);
         
         case AST_STRUCT_LITERAL: {
-            ASTNode* def_node = find_struct(node->struct_literal.name);
-            if (!def_node) {
+            // Run 28: BORROW the registry's canonical StructDef. The old code
+            // malloc'd a fresh StructDef + strdup'd the name per literal and
+            // nobody ever freed them (value_release can't — clones share the
+            // pointer), orphaning 19 B per literal forever.
+            StructDef* def = find_struct_def(node->struct_literal.name);
+            if (!def) {
                 fprintf(stderr, "Error: Struct '%s' not defined.\n", node->struct_literal.name);
                 return make_null();
             }
 
             StructInstance* instance = malloc(sizeof(StructInstance));
-            instance->definition = malloc(sizeof(StructDef));
-            instance->definition->name = strdup(node->struct_literal.name);
-            instance->definition->ast_node = def_node;
+            instance->definition = def; // borrowed; owned by the registry
             instance->fields = NULL;
 
             for (size_t i = 0; i < node->struct_literal.fields->count; i++) {
@@ -3501,7 +3521,13 @@ int interpret(ASTNode* program) {
     }
 
 
+    // Run 28: script mode now tears down the registries (it never did —
+    // bindings leaked per run as still-reachable globals). Order matters:
+    // env first (value_release touches definition), then the registry that
+    // owns the canonical defs. Same order as the REPL exit path.
     env_free();
+    env_free_structs();
+    env_free_enums();
     interpreter_cleanup_event_loop();
     return 0;
 }
