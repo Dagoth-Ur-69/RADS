@@ -1,80 +1,88 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 26)
+Last updated: 2026-10-15 (cron run 27)
 Branch: `phase0/build-recovery`
-HEAD: d518ac8 — fix: regex.replace overflow + search crash (run 26)
+HEAD: e71ed1a — test: REPL regression gate (run 27)
 
 ## What this run changed
 
-**Run 26 = journal "Next up": the exit-time BcFunc cache free** — dead, with
-a negative-control corpse for proof. Plus the same-run sibling sweep, which
-found two MORE memory-safety corpses in regex.
+**Run 27 = journal "Next up": the REPL dangling func_node** — dead, and
+the dig found the corpse was worse than journalled: the REPL could not
+define functions AT ALL. Three corpses, one ownership class:
 
-1. **BcFunc bytecode-cache free** (`ast.c` + `interpreter.c` + `interpreter.h`):
-   every compiled function left its BcFunc allocation (56 bytes + code and
-   consts arrays) on `function_decl.bc_cache`, never freed at exit — the last
-   engine-wide leak class (documented run 24). `ast_free(AST_FUNCTION_DECL)`
-   now calls the opaque `interpreter_free_bc_cache(void*)`; NULL and the
-   `(void*)1` bail-out sentinel are ignored; `code`, strdup'd `consts`,
-   `call_sites` array (entries are borrowed AST pointers), and the struct are
-   freed. Safety argument: `value_release` has no VAL_FUNCTION case (function
-   values borrow `func_node`), so the program AST is the sole owner and
-   `ast_free` is the single teardown chokepoint; file mode frees env before
-   `ast_free(program)`. **Negative control**: 9-function probe, old build
-   under LSan = 1377 bytes leaked in 19 allocations (bc_compile:2804 et al),
-   patched build = zero.
+1. **REPL function registration** (`interpreter.c`): `exec_statement`
+   has no AST_FUNCTION_DECL case, so a `blast` line fell to default:,
+   was evaluated as a discarded VAL_FUNCTION expression and never
+   reached env_set — "Undefined function" on the very next call.
+   Registration was unreachable, which is why the journalled UAF had
+   never fired in practice. `interpret_repl_statement` now routes
+   AST_FUNCTION_DECL through `exec_function`, mirroring script-mode
+   interpret() Pass 1.
 
-2. **regex.replace heap-buffer-overflow WRITE** (`stdlib_regex.c`): result
-   buffer sized by estimate `2*strlen + 2*repl_len` — overflowed on
-   all-match strings with multi-char replacements (`[0-9]` on "1111111111"
-   with "XYZ": needs 31, allocated 26). Reproduced under ASAN (strcpy
-   overflow) on pristine source. Rewritten as two-pass exact-size, same
-   shape as the run-25 str.replace fix.
+2. **REPL struct/enum lines could not even PARSE** (`parser.c/.h`): the
+   REPL called parse_statement directly, which has no struct/enum route
+   ("Expected ';' after expression" on line 1). New public
+   `parse_repl_line()` wraps static `parse_declaration` — all top-level
+   forms (import/struct/enum/async/blast) plus every statement shape.
 
-3. **regex.replace zero-width parity**: trailing empty match at EOS was
-   dropped — `re.sub(r'x*','-','abc')` is `-a-b-c-`, RADS returned
-   `-a-b-c`. Now probes for empty-match-at-EOS: full Python re.sub parity
-   including `a*` on "aaaa" → `--` and empty input → `-`.
+3. **The UAF itself** (`main.c`): with registration alive, the per-line
+   `ast_free(stmt)` dangled every func_node AND every struct/enum decl
+   node the persistent env/registries borrow (env_free_structs' comment
+   "owned by the main AST" is only true in script mode). Fixed with a
+   per-line AST arena: run_repl retains every parsed root and frees
+   them in bulk at shutdown, AFTER interpreter_cleanup_environment() —
+   safe because all borrowers are pure (value_release has no
+   VAL_FUNCTION case; env_free_structs/enums free only their binding
+   structs). **Negative control**: registration-without-arena build
+   reproduces the exact ASAN heap-use-after-free in bc_try_execute
+   (interpreter.c:3362 via eval_call → invoke_callee →
+   interpreter_execute_callback); full fix = clean.
 
-4. **regex.search uninitialized-pointer crash**: `StructInstance->definition`
-   was never set; printing a search result dereferenced garbage (0xbebebebe
-   SEGV in `value_to_string_impl` under ASAN). Fixed with a static borrowed
-   definition label — safe because `value_release` never frees `definition`.
+4. **REPL regression gate** (`run_tests.sh`): feeds the REPL a probe via
+   stdin (struct decl, blast fns, calls, struct instance held across
+   lines, recursion fib(15)) and asserts outputs 5/arena/610 plus no
+   "Undefined function". ANSI color codes stripped before matching.
 
-5. **tests/test_regex.rads** (module had NO test file): overflow-corpse
-   regression, zero-width parity, search-crash regression, findall/split/
-   match baselines via joins (array `==` is not deep in RADS — joined-string
-   comparison instead). Wired into `run_tests.sh` → gauntlet now 26 tests.
+## Test results (run 27)
 
-## Test results (run 26)
-
-Clean rebuild, gauntlet **26/26** (test_regex new). A/B byte-identical BC vs
-`RADS_NO_BC=1` on test_regex. ASAN/UBSAN: regex tests clean (search crash
-repro'd before fix, gone after; overflow repro'd before fix, gone after).
-LSan differential on the BcFunc probe: old 1377 B / 19 allocs → new 0.
-Pushed to fork: `82f0003..d518ac8` (11d787b BcFunc free, d518ac8 regex fixes
-+ test).
+Clean rebuild, gauntlet **26/26 + new REPL gate**. ASAN full probe
+clean (struct instance + enum + recursion). Leak parity: 86 B / 4
+allocs leak IDENTICALLY in script mode on the same code (pre-existing
+struct-literal orphans, see hazards) — the arena adds zero new leaks.
+Pushed to fork: `0247539..e71ed1a` (9329354 engine fix, e71ed1a gate).
 
 ## Known hazards (noted, not fixed — pre-existing)
 
-- **REPL dangling `func_node`**: `main.c` frees each line's AST while the
-  persistent env still holds `VAL_FUNCTION` values borrowing that AST's
-  `func_node` → any function defined in the REPL then called after its line's
-  `ast_free` is a use-after-free. Needs an ownership decision (per-line AST
-  arena kept alive until env teardown vs. deep-copying closures). Do NOT
-  treat REPL function definitions as safe until this is fixed.
+- **Struct-literal orphan leak (86 B / 4 allocs per probe)**: `Pt {...}`
+  literals leak instance->definition->name strdup (interpreter.c:1609)
+  plus a 16 B eval orphan — identical in script AND REPL mode, so not
+  arena-related. Candidate for the next hygiene pass.
+- **REPL `import` sub-AST never freed**: exec_statement's import case
+  parses the imported file and never ast_free(imported_ast) — same in
+  script mode, pre-existing.
+- `turbo i32 c = GREEN;` echoes null — enum member resolution
+  semantics, identical in script mode; not a REPL regression.
 
 ## Next up (single task for next run)
 
-1. **REPL dangling func_node fix** — decide ownership: per-line AST arena
-   (REPL keeps every line's AST alive until `interpreter_cleanup_environment`)
-   is the smallest safe change; verify with ASAN repro (define fn in REPL,
-   call it after the next prompt, exit) before/after. This closes the last
-   known use-after-free class in the engine.
+1. **Struct-literal orphan leak** (above): borrow a static definition
+   label (the regex.search run-26 pattern) instead of strdup-per-literal,
+   and chase the 16 B eval orphan at interpreter.c:1609. LSan
+   differential before/after on the same probe, script + REPL modes.
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
 vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 26 (previous run — summary retained below)
+
+BcFunc exit-cache free through the ast_free chokepoint (negative
+control: 1377 B / 19 allocs → 0); sibling sweep found regex.replace
+heap-overflow WRITE (estimate-sized buffer) rewritten two-pass,
+zero-width EOS parity, and regex.search's uninitialized
+StructInstance->definition SEGV (static borrowed label fix);
+tests/test_regex.rads born and wired in → gauntlet 26/26. A/B
+byte-identical. Commits 11d787b, d518ac8, 0247539 on fork.
 
 ## Run 25 (previous run — summary retained below)
 
@@ -427,6 +435,16 @@ fall back to AGENTS.md workstream priority.
 
 ## Run log (one line each)
 
+- run 27: REPL ownership class slain — the journal's dangling func_node was
+  buried under TWO layers: functions never registered at all (no
+  AST_FUNCTION_DECL case in exec_statement) and struct/enum lines never
+  parsed (REPL used parse_statement). Fixed with parse_repl_line() over
+  parse_declaration, exec_function registration in
+  interpret_repl_statement, and a per-line AST arena freed after env
+  teardown. ASAN negative control: registration-without-arena reproduces
+  the exact bc_try_execute UAF; full fix clean. Gauntlet 26/26 + REPL
+  regression gate. 9329354, e71ed1a on fork. Next: struct-literal orphan
+  leak (86 B/4 allocs, both modes).
 - run 24: list & dict comprehensions shipped — `[x*2 for x in xs if c]` /
   `{k: v for x in xs}` in BOTH paths (AST_COMPREHENSION_EXPR + flat
   clause list; tree-walker recursion mirroring cruise ownership rules;
