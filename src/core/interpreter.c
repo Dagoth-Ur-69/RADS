@@ -96,6 +96,95 @@ void array_push(Array* arr, Value v) {
     arr->items[arr->count++] = value_clone_impl(v);
 }
 
+// ---------------------------------------------------------------------------
+// Dict helpers — VAL_DICT is a flat kv payload in array_val: [k0, v0, k1, v1,
+// ...] (same representation json.parse produces). Keys are strings (int/float
+// keys are stringified) and LAST write wins: d[k]=v updates an existing k in
+// place, else appends the pair.
+// ---------------------------------------------------------------------------
+
+// Key coercion: dict keys are strings. int/float keys stringify.
+static char* dict_key_string(Value* key) {
+    char buf[64];
+    switch (key->type) {
+        case VAL_STRING:
+            return strdup(key->string_val ? key->string_val : "");
+        case VAL_INT:
+            snprintf(buf, sizeof buf, "%lld", key->int_val);
+            return strdup(buf);
+        case VAL_FLOAT:
+            snprintf(buf, sizeof buf, "%g", key->float_val);
+            return strdup(buf);
+        default:
+            return NULL; // null/bool/array/... not hashable — miss
+    }
+}
+
+// Find the value slot for key; NULL if absent. Borrows.
+static Value* dict_find(Array* d, const char* key) {
+    if (!d || !key) return NULL;
+    for (size_t i = 0; i + 1 < d->count; i += 2) {
+        if (d->items[i].type == VAL_STRING && d->items[i].string_val &&
+            strcmp(d->items[i].string_val, key) == 0) {
+            return &d->items[i + 1];
+        }
+    }
+    return NULL;
+}
+
+// index read: d["k"] / d[k] — dict branch; returns true if handled (result
+// always set to an OWNING value)
+static bool dict_index_read(Value* container, Value* key, Value* result) {
+    if (container->type != VAL_DICT) return false;
+    char* ks = dict_key_string(key);
+    if (!ks) { *result = make_null(); return true; }
+    Value* slot = dict_find(container->array_val, ks);
+    if (slot) {
+        if (slot->type == VAL_STRING) {
+            *result = make_string(slot->string_val);
+        } else if ((slot->type == VAL_ARRAY || slot->type == VAL_DICT) && slot->array_val) {
+            // share with a refcount bump (nested-container rule, run 13)
+            slot->array_val->refcount++;
+            *result = *slot;
+        } else {
+            *result = *slot;
+        }
+    } else {
+        *result = make_null();
+    }
+    free(ks);
+    return true;
+}
+
+// d[k] = v on a container slot (env var or array element). Returns an owning
+// clone of v (the assignment result). Array index-assign also lives here —
+// run 13 corpse: `a[0] = 9` was a silent no-op.
+static Value dict_store(Array* d, Value* key, Value* v, bool as_dict) {
+    char* ks = dict_key_string(key);
+    if (ks) {
+        Value* slot = dict_find(d, ks);
+        if (slot) {
+            free(ks); // borrowed for the lookup only
+            value_release(slot);
+            *slot = value_clone_impl(*v);
+        } else {
+            Value kv;
+            kv.type = VAL_STRING;
+            kv.string_val = ks;
+            ks = NULL; // ownership moved into the payload
+            array_push(d, kv);        // clones
+            value_release(&kv);
+            array_push(d, *v);        // clones
+        }
+    }
+    if (as_dict && d->count % 2 == 1) {
+        // odd count on a dict path can only happen on a malformed key — drop
+        // the dangling key so the payload stays well-formed
+        d->count--;
+    }
+    return value_clone_impl(*v);
+}
+
 static Value make_array_from_list(ASTList* elements) {
     Array* arr = array_create(elements ? elements->count : 0);
     if (elements) {
@@ -129,6 +218,7 @@ static Value value_clone_impl(Value v) {
             out.string_val = strdup(v.string_val);
             break;
         case VAL_ARRAY:
+        case VAL_DICT: // same refcounted flat payload, shared on clone
             if (v.array_val) v.array_val->refcount++;
             break;
         case VAL_STRUCT_INSTANCE:
@@ -169,6 +259,7 @@ static void value_release(Value* value) {
             free(value->string_val);
             break;
         case VAL_ARRAY:
+        case VAL_DICT: // identical flat-kv payload lifecycle
             if (value->array_val) {
                 if (value->array_val->refcount > 0) value->array_val->refcount--;
                 if (value->array_val->refcount == 0) {
@@ -249,6 +340,21 @@ static void value_to_string_impl(StrBuf* b, Value* value) {
                 value_to_string_impl(b, &value->array_val->items[i]);
             }
             strbuf_append(b, "]");
+            break;
+        }
+        case VAL_DICT: {
+            // echo/print format: Python dict repr {"k": v, ...}. Keys print
+            // JSON-style (always double quotes) — matches json.stringify.
+            strbuf_append(b, "{");
+            for (size_t i = 0; i + 1 < value->array_val->count; i += 2) {
+                if (i > 0) strbuf_append(b, ", ");
+                strbuf_append(b, "\"%s\"", value->array_val->items[i].string_val
+                                                 ? value->array_val->items[i].string_val
+                                                 : "");
+                strbuf_append(b, ": ");
+                value_to_string_impl(b, &value->array_val->items[i + 1]);
+            }
+            strbuf_append(b, "}");
             break;
         }
         case VAL_FUNCTION:
@@ -758,6 +864,31 @@ static Value eval_call(ASTNode* node) {
             }
         }
 
+        // Dict method calls: d.keys() / d.get(k, dflt) / ... — receiver
+        // prepended as args[0], "dict.<member>" native surface (mirrors the
+        // str.* dispatch above).
+        if (obj_val.type == VAL_DICT && member) {
+            char native_name[64];
+            snprintf(native_name, sizeof(native_name), "dict.%s", member);
+            NativeFn native = find_native(native_name);
+            if (native) {
+                int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
+                Value stack_args[8];
+                Value* args = (argc + 1 <= 8) ? stack_args : malloc(sizeof(Value) * (argc + 1));
+                args[0] = value_clone_impl(obj_val); // native owns this
+                for (int i = 0; i < argc; i++) {
+                    args[i + 1] = eval_expression(node->call_expr.arguments->nodes[i]);
+                }
+                Value result = native(global_interpreter, argc + 1, args);
+                for (int i = 0; i < argc + 1; i++) {
+                    value_free(&args[i]);
+                }
+                if (args != stack_args) free(args);
+                value_free(&obj_val);
+                return result;
+            }
+        }
+
         if (obj_val.type == VAL_STRING && member) {
             // Python-style method surface first ("x".upper() -> str.upper),
             // then net-handle methods (server.route et al). str.* wins on
@@ -1205,14 +1336,23 @@ static Value eval_expression(ASTNode* node) {
         case AST_BOOL_LITERAL:
             return make_bool(node->bool_literal.value);
         
-        case AST_ARRAY_LITERAL:
-            return make_array_from_list(node->array_literal.elements);
+        case AST_ARRAY_LITERAL: {
+            Value v = make_array_from_list(node->array_literal.elements);
+            if (node->array_literal.is_dict) {
+                // {"k": v} literal — same payload, dict semantics on top.
+                v.type = VAL_DICT;
+            }
+            return v;
+        }
         
         case AST_INDEX_EXPR: {
             Value arr = eval_expression(node->index_expr.array);
             Value idx = eval_expression(node->index_expr.index);
             Value result = make_null();
-            if (arr.type == VAL_ARRAY && idx.type == VAL_INT) {
+            if (arr.type == VAL_DICT) {
+                // d["k"] / d[k] — keyed read; missing key yields null.
+                dict_index_read(&arr, &idx, &result);
+            } else if (arr.type == VAL_ARRAY && idx.type == VAL_INT) {
                 if (idx.int_val >= 0 && (size_t)idx.int_val < arr.array_val->count) {
                     // return copy
                     Value elem = arr.array_val->items[idx.int_val];
@@ -1252,6 +1392,7 @@ static Value eval_expression(ASTNode* node) {
                 case VAL_BOOL: type_str = "bool"; break;
                 case VAL_NULL: type_str = "null"; break;
                 case VAL_ARRAY: type_str = "array"; break;
+                case VAL_DICT: type_str = "dict"; break;
                 case VAL_FUNCTION: type_str = "function"; break;
                 case VAL_STRUCT_DEF: type_str = "struct_def"; break;
                 case VAL_STRUCT_INSTANCE: type_str = "struct"; break;
@@ -1315,6 +1456,26 @@ static Value eval_expression(ASTNode* node) {
             Value value = eval_expression(node->assign_expr.value);
             ASTNode* target = node->assign_expr.target;
 
+            if (target->type == AST_INDEX_EXPR && target->index_expr.array->type == AST_IDENTIFIER) {
+                // d[k] = v / a[i] = v — index-assign on a named container.
+                // Evaluates value-first (matching the identifier path's
+                // eval order), then mutates the env binding in place.
+                const char* var_name = target->index_expr.array->identifier.name;
+                Value* ref = env_get_ref(var_name);
+                if (ref && (ref->type == VAL_DICT || ref->type == VAL_ARRAY)) {
+                    Value idx = eval_expression(target->index_expr.index);
+                    if (ref->type == VAL_DICT) {
+                        dict_store(ref->array_val, &idx, &value, true); // stores its own clone
+                    } else if (idx.type == VAL_INT &&
+                               idx.int_val >= 0 &&
+                               (size_t)idx.int_val < ref->array_val->count) {
+                        value_release(&ref->array_val->items[idx.int_val]);
+                        ref->array_val->items[idx.int_val] = value_clone_impl(value);
+                    }
+                    value_free(&idx);
+                }
+                return value; // owning result (env was mutated in place)
+            }
             if (target->type == AST_IDENTIFIER) {
                 // env_set takes ownership; the expression result must be
                 // separately owned by the caller, so clone for the env.
@@ -1864,6 +2025,8 @@ typedef enum {
     BC_RET,      // pop return value; function exits
     BC_ECHO,     // pop; value_print + newline (echo statement)
     BC_MKARR,    // imm: u16 n — pop n elements, push array literal (round 7)
+    BC_MKDICT,   // imm: u16 n — pop n kv elements, push dict literal (round 23: {"k": v})
+    BC_SETIDX,   // imm: u16 slot — pop value, idx; container[slot][idx] = value (round 23)
     BC_CALLM,    // dotted call: imm u8 argc, u16 site, u16 full-name idx, u16 member idx (round 7)
     BC_SLOT_BIN, // imm: u16 slot, u8 op — local[slot] = local[slot] <op> TOS, in place (round 8)
     BC_GETIDX,   // pop idx, arr; push arr[idx] clone (round 9 — mirrors eval index path)
@@ -2122,6 +2285,9 @@ static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
             // order (tree-walker order), then BC_MKARR moves them — owned,
             // no re-clone — into a fresh array, matching
             // make_array_from_list's observable behavior.
+            // Round 23: is_dict literals emit BC_MKDICT instead — same
+            // payload layout, VAL_DICT tag on top for keyed reads/writes and
+            // dict.* methods.
             size_t n = e->array_literal.elements ? e->array_literal.elements->count : 0;
             if (n > BC_MAX_ARR_ELEMS) return false;
             if (e->array_literal.elements) {
@@ -2129,7 +2295,7 @@ static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
                     if (!bc_compile_expr(c, e->array_literal.elements->nodes[i])) return false;
                 }
             }
-            bc_put(c, BC_MKARR);
+            bc_put(c, e->array_literal.is_dict ? BC_MKDICT : BC_MKARR);
             bc_put16(c, (uint16_t)n);
             return true;
         }
@@ -2318,7 +2484,25 @@ static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
             return true;
         }
         case AST_ASSIGN_EXPR: {
-            if (s->assign_expr.target->type != AST_IDENTIFIER) return false;
+            if (s->assign_expr.target->type != AST_IDENTIFIER) {
+                // Round 23: index-assign d[k] = v / a[i] = v on a slotted
+                // local compiles to BC_SETIDX. Non-slotted containers (or
+                // compound targets) bail to the tree-walker, whose env_get_ref
+                // path handles frames AND globals — semantics identical.
+                if (s->assign_expr.target->type == AST_INDEX_EXPR &&
+                    s->assign_expr.target->index_expr.array->type == AST_IDENTIFIER) {
+                    const char* cname = s->assign_expr.target->index_expr.array->identifier.name;
+                    int slot = bc_slot_of(c, cname);
+                    if (slot >= 0) {
+                        if (!bc_compile_expr(c, s->assign_expr.value)) return false;
+                        if (!bc_compile_expr(c, s->assign_expr.target->index_expr.index)) return false;
+                        bc_put(c, BC_SETIDX);
+                        bc_put16(c, (uint16_t)slot);
+                        return true;
+                    }
+                }
+                return false;
+            }
             const char* name = s->assign_expr.target->identifier.name;
             // Perf round 8: x = x <op> rhs with slotted x compiles to one
             // BC_SLOT_BIN (slot read-modify-write, no clone/free round-trip
@@ -2673,6 +2857,43 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 BC_PUSH(r);
                 break;
             }
+            case BC_MKDICT: {
+                // Round 23: {"k": v, ...} — same payload build as MKARR, then
+                // the VAL_DICT tag on top (keyed index read/write, dict.*
+                // methods, Python-style echo repr).
+                uint16_t n = ip[0] | (ip[1] << 8); ip += 2;
+                if (sp < (int)n) goto stack_underflow;
+                Array* arr = array_create(n);
+                for (uint16_t i = n; i > 0; i--) {
+                    Value v; BC_POP(v);
+                    arr->items[i - 1] = v;
+                }
+                arr->count = n;
+                Value r; r.type = VAL_DICT; r.array_val = arr;
+                BC_PUSH(r);
+                break;
+            }
+            case BC_SETIDX: {
+                // Round 23: d[k] = v / a[i] = v on slotted container.
+                // Stack order: ..., value, idx. Mirror of the tree-walker's
+                // AST_ASSIGN_EXPR index-target path.
+                uint16_t slot = ip[0] | (ip[1] << 8); ip += 2;
+                Value idx; BC_POP(idx);
+                Value val; BC_POP(val);
+                Value* ref = &slots[slot];
+                if (ref->type == VAL_DICT) {
+                    dict_store(ref->array_val, &idx, &val, true); // stores a clone
+                } else if (ref->type == VAL_ARRAY && idx.type == VAL_INT &&
+                           idx.int_val >= 0 &&
+                           (size_t)idx.int_val < ref->array_val->count) {
+                    value_release(&ref->array_val->items[idx.int_val]);
+                    ref->array_val->items[idx.int_val] = val; // move ownership in
+                    val = make_null();                        // consumed
+                }
+                value_free(&val);
+                value_free(&idx);
+                break;
+            }
             case BC_CALLM: {
                 // Dotted call obj.member(args) — mirrors eval_call's member
                 // dispatch step for step: array method path first (early
@@ -2705,6 +2926,23 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                             value_release(&obj_val.array_val->items[obj_val.array_val->count - 1]);
                             obj_val.array_val->count--;
                         }
+                        value_free(&obj_val);
+                        BC_PUSH(result);
+                        break;
+                    }
+                }
+                if (obj_val.type == VAL_DICT && member) {
+                    // Round 23: dict receivers dispatch dict.* natives with
+                    // the receiver prepended (mirror of the str.* lane).
+                    char native_name[64];
+                    snprintf(native_name, sizeof(native_name), "dict.%s", member);
+                    NativeFn dict_native = find_native(native_name);
+                    if (dict_native) {
+                        Value margs[BC_MAX_ARGS + 1];
+                        margs[0] = value_clone_impl(obj_val);
+                        for (int i = 0; i < cargc; i++) margs[i + 1] = cargs[i];
+                        Value result = dict_native(global_interpreter, cargc + 1, margs);
+                        for (int i = 0; i < cargc + 1; i++) value_free(&margs[i]);
                         value_free(&obj_val);
                         BC_PUSH(result);
                         break;
@@ -2757,7 +2995,11 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 Value idx; BC_POP(idx);
                 Value arr; BC_POP(arr);
                 Value result = make_null();
-                if (arr.type == VAL_ARRAY && idx.type == VAL_INT) {
+                if (arr.type == VAL_DICT) {
+                    // Round 23: keyed read — mirrors the tree-walker's
+                    // AST_INDEX_EXPR dict branch.
+                    dict_index_read(&arr, &idx, &result);
+                } else if (arr.type == VAL_ARRAY && idx.type == VAL_INT) {
                     if (idx.int_val >= 0 && (size_t)idx.int_val < arr.array_val->count) {
                         Value elem = arr.array_val->items[idx.int_val];
                         if (elem.type == VAL_STRING) {

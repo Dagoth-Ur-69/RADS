@@ -37,6 +37,7 @@
 #include "stdlib_uuid.h"
 #include "stdlib_collections.h"
 #include "stdlib_hash.h"
+#include "stdlib_dict.h"
 #include "stdlib_sort.h"
 #include "stdlib_itertools.h"
 #include "stdlib_http.h"
@@ -118,6 +119,7 @@ static void stdlib_register_all(void) {
     stdlib_time_register();
     stdlib_path_register();
     stdlib_hash_register();
+    stdlib_dict_register();
     stdlib_sort_register();
     stdlib_http_register();
     stdlib_async_utils_register();
@@ -548,6 +550,9 @@ int main(int argc, char* argv[]) {
     
     // Interpret
     int result = interpret(program);
+    // Test-failure latch (run 23): describe/it/run harness failures now
+    // propagate to the process exit code.
+    if (stdlib_test_failed()) result = 1;
     
     // Cleanup
     ast_free(program);

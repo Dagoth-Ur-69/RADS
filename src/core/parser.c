@@ -369,7 +369,7 @@ static ASTNode* parse_primary(Parser* parser) {
             } while (match(parser, TOKEN_COMMA));
         }
         consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after map literal");
-        return ast_create_array_literal(elements, line, column);
+        return ast_create_dict_literal(elements, line, column);
     }
 
     // Anonymous function: blast(params) { body }

@@ -121,6 +121,25 @@ static char* py_str_value(Value* v, int depth) {
             out[len] = ']'; out[len + 1] = '\0';
             return out;
         }
+        case VAL_DICT: {
+            size_t cap = 64, len = 0;
+            char* out = malloc(cap); out[0] = '\0';
+            len += snprintf(out + len, cap - len, "%s", "{");
+            int first = 1;
+            for (size_t i = 0; i + 1 < v->array_val->count; i += 2) {
+                if (!first) { len += snprintf(out + len, cap - len, "%s", ", "); }
+                first = 0;
+                char* k = py_str_value(&v->array_val->items[i], depth + 1);
+                char* val = py_str_value(&v->array_val->items[i + 1], depth + 1);
+                size_t elen = strlen(k) + strlen(val) + 2;
+                while (len + elen + 2 > cap) { cap *= 2; out = realloc(out, cap); }
+                len += snprintf(out + len, cap - len, "%s: %s", k, val);
+                free(k); free(val);
+            }
+            if (len + 2 > cap) { cap += 2; out = realloc(out, cap); }
+            out[len] = '}'; out[len + 1] = '\0';
+            return out;
+        }
         default: {
             char* s = value_to_string(v); /* functions/structs: echo format */
             return s ? s : strdup("null");
@@ -170,14 +189,22 @@ static bool has_after_each = false;
 // Current assertion state
 static bool current_test_passed = true;
 static char* current_test_message = NULL;
+// Run-level failure latch (run 23): once any test fails, the process exit
+// code must be nonzero — run_tests.sh judges by rc, and green-on-red runs
+// were invisible.
+static bool any_test_failed = false;
 
 // Helper: Create assertion result
 static void set_test_result(bool passed, const char* message) {
-    current_test_passed = passed;
-    if (current_test_message) {
-        free(current_test_message);
+    // Sticky failure (run 23): a later passing assertion must not erase an
+    // earlier failure in the same test — expect chains reported false greens.
+    if (!passed) {
+        current_test_passed = false;
+        if (current_test_message) {
+            free(current_test_message);
+        }
+        current_test_message = message ? strdup(message) : NULL;
     }
-    current_test_message = message ? strdup(message) : NULL;
 }
 
 // test.describe(name, callback) - Define a test suite
@@ -594,6 +621,7 @@ Value stdlib_test_run(Interpreter* interp, int argc, Value* args) {
                 suite->passed++;
                 total_passed++;
             } else {
+                any_test_failed = true;
                 printf("  %s✗%s %s\n", COLOR_RED, COLOR_RESET, test->name);
                 if (current_test_message) {
                     printf("    %s└─ %s%s\n", COLOR_DIM, current_test_message, COLOR_RESET);
@@ -681,7 +709,10 @@ Value stdlib_test_len(Interpreter* interp, int argc, Value* args) {
     if (args[0].type == VAL_ARRAY && args[0].array_val) {
         return make_int((long long)args[0].array_val->count);
     }
-    fprintf(stderr, "Error: len() requires a string or array\n");
+    if (args[0].type == VAL_DICT && args[0].array_val) {
+        return make_int((long long)(args[0].array_val->count / 2));
+    }
+    fprintf(stderr, "Error: len() requires a string, array or dict\n");
     return make_int(0);
 }
 
@@ -716,6 +747,7 @@ Value stdlib_test_type(Interpreter* interp, int argc, Value* args) {
         case VAL_BOOL:   return make_string("bool");
         case VAL_NULL:   return make_string("null");
         case VAL_ARRAY:  return make_string("array");
+        case VAL_DICT:   return make_string("dict");
         case VAL_FUNCTION: return make_string("function");
         case VAL_STRUCT_DEF: return make_string("struct_def");
         case VAL_STRUCT_INSTANCE: return make_string("struct");
@@ -738,6 +770,8 @@ Value stdlib_test_abs(Interpreter* interp, int argc, Value* args) {
     fprintf(stderr, "Error: abs() requires a number\n");
     return make_int(0);
 }
+
+bool stdlib_test_failed(void) { return any_test_failed; }
 
 void stdlib_test_register(void) {
     // pythonic bare aliases (run 17: test_time needs assert/str/type/abs at top level)

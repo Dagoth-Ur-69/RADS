@@ -298,6 +298,16 @@ ASTNode* ast_create_array_literal(ASTList* elements, int line, int column) {
     node->line = line;
     node->column = column;
     node->array_literal.elements = elements;
+    node->array_literal.is_dict = false;
+    return node;
+}
+
+// Dict literal {"k": v, ...}: stored as the same flat kv element list, but
+// tagged so evaluation produces a VAL_DICT (prints {"k": v}, dict methods,
+// keyed indexing) instead of a plain array.
+ASTNode* ast_create_dict_literal(ASTList* elements, int line, int column) {
+    ASTNode* node = ast_create_array_literal(elements, line, column);
+    node->array_literal.is_dict = true;
     return node;
 }
 

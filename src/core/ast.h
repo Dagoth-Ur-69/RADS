@@ -265,6 +265,7 @@ struct ASTNode {
         // Array literal
         struct {
             ASTList* elements;
+            bool is_dict; // true when parsed from {"k": v} — kv payload
         } array_literal;
         
         // Index expression
@@ -350,6 +351,7 @@ ASTNode* ast_create_call(ASTNode* callee, ASTList* arguments, int line, int colu
 ASTNode* ast_create_member_expr(ASTNode* object, const char* member, int line, int column);
 ASTNode* ast_create_struct_literal(const char* name, ASTList* fields, int line, int column);
 ASTNode* ast_create_array_literal(ASTList* elements, int line, int column);
+ASTNode* ast_create_dict_literal(ASTList* elements, int line, int column);
 ASTNode* ast_create_index(ASTNode* array, ASTNode* index, int line, int column);
 ASTNode* ast_create_assign(ASTNode* target, ASTNode* value, int line, int column);
 ASTNode* ast_create_cruise(const char* iterator, ASTNode* iterable, ASTNode* body, int line, int column);

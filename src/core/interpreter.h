@@ -22,6 +22,7 @@ typedef enum {
     VAL_STRING,
     VAL_FUNCTION,
     VAL_ARRAY,
+    VAL_DICT,           // flat kv payload in array_val: [k0, v0, k1, v1, ...]
     VAL_STRUCT_DEF,
     VAL_STRUCT_INSTANCE
 } ValueType;
