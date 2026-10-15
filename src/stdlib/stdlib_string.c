@@ -173,32 +173,56 @@ Value native_str_replace(struct Interpreter* interp, int argc, Value* args) {
     const char* str = args[0].string_val;
     const char* find = args[1].string_val;
     const char* replace = args[2].string_val;
-    
-    if (strlen(find) == 0) {
-        Value v;
-        v.type = VAL_STRING;
-        v.string_val = strdup(str);
-        return v;
-    }
-    
-    const char* pos = strstr(str, find);
-    if (!pos) {
-        Value v;
-        v.type = VAL_STRING;
-        v.string_val = strdup(str);
-        return v;
-    }
-    
-    size_t prefix_len = pos - str;
+
     size_t find_len = strlen(find);
+
+    if (find_len == 0) {
+        Value v;
+        v.type = VAL_STRING;
+        v.string_val = strdup(str);
+        return v;
+    }
+
+    // Python semantics: replace ALL occurrences.
+    // Pass 1: count matches for an exact single allocation.
+    size_t match_count = 0;
+    const char* scan = str;
+    while ((scan = strstr(scan, find)) != NULL) {
+        match_count++;
+        scan += find_len;
+    }
+
+    if (match_count == 0) {
+        Value v;
+        v.type = VAL_STRING;
+        v.string_val = strdup(str);
+        return v;
+    }
+
     size_t replace_len = strlen(replace);
-    size_t suffix_len = strlen(pos + find_len);
-    
-    char* result = malloc(prefix_len + replace_len + suffix_len + 1);
-    memcpy(result, str, prefix_len);
-    memcpy(result + prefix_len, replace, replace_len);
-    memcpy(result + prefix_len + replace_len, pos + find_len, suffix_len);
-    result[prefix_len + replace_len + suffix_len] = '\0';
+    size_t str_len = strlen(str);
+    size_t cap = str_len + match_count * (replace_len > find_len ? replace_len - find_len : 0) + 1;
+    char* result = malloc(cap);
+    if (!result) {
+        Value v;
+        v.type = VAL_NULL;
+        return v;
+    }
+
+    // Pass 2: copy segments between matches, splicing in replacements.
+    const char* src = str;
+    char* dst = result;
+    while ((scan = strstr(src, find)) != NULL) {
+        size_t prefix = (size_t)(scan - src);
+        memcpy(dst, src, prefix);
+        dst += prefix;
+        memcpy(dst, replace, replace_len);
+        dst += replace_len;
+        src = scan + find_len;
+    }
+    size_t tail = strlen(src);
+    memcpy(dst, src, tail);
+    dst[tail] = '\0';
     
     Value v;
     v.type = VAL_STRING;
