@@ -97,6 +97,9 @@ void register_native_fn(const char* module, const char* name, NativeFn fn);
 uv_loop_t* interpreter_init_event_loop(void);
 void interpreter_cleanup_event_loop(void);
 void interpreter_cleanup_environment(void);
+// Opaque teardown for ASTNode.function_decl.bc_cache (safe for NULL and the
+// (void*)1 bail-out marker); called from ast_free().
+void interpreter_free_bc_cache(void* bc_cache);
 void interpreter_run_event_loop(void);
 Value interpreter_execute_callback(Value callback, int argc, Value* args);
 

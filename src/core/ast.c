@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ast.h"
+#include "interpreter.h" // interpreter_free_bc_cache (opaque bc_cache teardown)
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -501,6 +502,11 @@ void ast_free(ASTNode* node) {
             ast_list_free(node->function_decl.parameters);
             type_info_free(node->function_decl.return_type);
             ast_free(node->function_decl.body);
+            // Bytecode cache (perf round 4): BcFunc is owned by this node —
+            // NULL = never compiled, (void*)1 = bailed to tree-walker, else
+            // a real allocation that must not outlive the AST. Opaque free
+            // in interpreter.c (ast.c cannot see the internal type).
+            interpreter_free_bc_cache(node->function_decl.bc_cache);
             break;
         case AST_VARIABLE_DECL:
             free(node->variable_decl.name);

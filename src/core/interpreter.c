@@ -2814,6 +2814,21 @@ static bool bc_compile(ASTNode* func, BcFunc** out) {
     return true;
 }
 
+// Free a bytecode-compiled function cache. Public-but-opaque: ast_free()
+// calls this for every AST_FUNCTION_DECL node; the BcFunc layout is private
+// to this file. Accepts the raw bc_cache field verbatim — NULL (never
+// compiled) and (void*)1 (compile bail-out marker) are safely ignored, so
+// callers never need to interpret the field.
+void interpreter_free_bc_cache(void* bc_cache) {
+    if (!bc_cache || bc_cache == (void*)1) return;
+    BcFunc* f = (BcFunc*)bc_cache;
+    free(f->code);                       // opcode stream
+    for (size_t i = 0; i < f->const_count; i++) free((void*)f->consts[i]); // strdup'd
+    free(f->consts);                     // name/string table
+    free(f->call_sites);                 // borrowed AST ptrs — array only
+    free(f);
+}
+
 // Inline truthiness (matches is_truthy exactly; avoids the call in hot loops)
 static inline bool bc_truthy(Value v) {
     switch (v.type) {
