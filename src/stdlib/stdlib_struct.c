@@ -372,7 +372,9 @@ Value stdlib_struct_unpack(Interpreter* interp, int argc, Value* args) {
     for (int i = fi; fmt[i]; i++) {
         int sz = fmt_size(fmt[i]);
         if (sz == 0) continue;
-        array_push(arr, parse_value(data + pos, fmt[i], big_endian));
+        Value pv = parse_value(data + pos, fmt[i], big_endian);
+        array_push(arr, pv);
+        value_free(&pv); // array_push cloned it; release our copy
         pos += sz; // invariant: pos <= needed <= data_len
     }
     free(data);
@@ -493,7 +495,9 @@ Value stdlib_struct_unpack_from(Interpreter* interp, int argc, Value* args) {
     for (int i = fi; fmt[i]; i++) {
         int sz = fmt_size(fmt[i]);
         if (sz == 0) continue;
-        array_push(arr, parse_value(data + pos, fmt[i], big_endian));
+        Value pv = parse_value(data + pos, fmt[i], big_endian);
+        array_push(arr, pv);
+        value_free(&pv); // array_push cloned it; release our copy
         pos += (size_t)sz; // invariant: pos <= offset + needed <= data_len
     }
     free(data);
@@ -542,13 +546,16 @@ Value stdlib_struct_iter_unpack(Interpreter* interp, int argc, Value* args) {
             int sz = fmt_size(fmt[i]);
             if (sz == 0) continue;
             // invariant: pos + sz <= (r+1)*record_size <= data_len
-            array_push(inner, parse_value(data + pos, fmt[i], big_endian));
+            Value pv = parse_value(data + pos, fmt[i], big_endian);
+            array_push(inner, pv);
+            value_free(&pv); // array_push cloned it; release our copy
             pos += (size_t)sz;
         }
         Value inner_val;
         inner_val.type = VAL_ARRAY;
         inner_val.array_val = inner;
         array_push(outer, inner_val);
+        value_free(&inner_val); // array_push cloned (refcount++); release ours
     }
     free(data);
 
