@@ -1,8 +1,65 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-14 (cron run 22)
+Last updated: 2026-10-14 (cron run 23)
 Branch: `phase0/build-recovery`
-HEAD: 682eacd — feat: Python-exact str()/print + f-strings + bare len + sci-notation literals
+HEAD: bfc39f4 — feat: dictionaries end-to-end (VAL_DICT over flat kv payloads)
+
+## What this run changed
+
+**Run 23 = journal "Next up" (dicts half): dictionaries end-to-end.** The
+plan changed from "kv-array semantics" to a thin **VAL_DICT core type**
+during recon — pure kv-arrays print as `["a", 1]` (repr ambiguity) and
+cannot carry methods. Design: `{}` literals keep the flat kv `Array*`
+payload (identical to json.parse's), but a new `VAL_DICT` tag rides the
+existing refcount machinery. One type, every memory rule reused.
+
+1. **Core**: `VAL_DICT` in `ValueType`; `{...}` parses to
+   `AST_ARRAY_LITERAL` + `is_dict` flag (`ast_create_dict_literal`);
+   tree-walker + VM (new `BC_MKDICT`/`BC_SETIDX` opcodes) both grow
+   keyed read (`dict_index_read` — string/int/float keys, missing → null)
+   and keyed write (`dict_store` — replace-or-append, last write wins).
+   **Also fixed the ancient `a[i] = v` silent no-op corpse for arrays**
+   (same AST_ASSIGN_EXPR index-target path).
+
+2. **Methods**: new `src/stdlib/stdlib_dict.c` — `len/keys/values/items/
+   get/contains/pop/update/setdefault/copy`; `d.keys()` dispatch prepends
+   the receiver like the str.* lane (eval_call + BC_CALLM both).
+
+3. **Printing**: `echo` shows `{"k": v}`; `str()` shows Python's
+   `{'a': 1}`; `type(d)` = `"dict"`; `len(d)` = pair count.
+
+4. **json**: `json.parse` objects return VAL_DICT (duplicate keys:
+   last wins, RFC 8259); `json.get/keys/values/has_key/type_of` accept
+   dicts. THREE latent bugs fixed en route: **json.get returned a
+   BORROWED payload reference → heap corruption** (now clones);
+   **jp_parse_object leaked every key and value** (array_push clones,
+   parsed originals never freed); the array→object stringify heuristic
+   stays array-only now that dicts are explicit.
+
+5. **Test framework hardening**: `set_test_result` is sticky-failure (a
+   later passing expect erased an earlier failure — false greens since
+   inception), and any test failure now propagates to the process exit
+   code (`stdlib_test_failed()` + main.c check; run_tests.sh judges rc).
+
+**Test results:** clean rebuild RC=0; gauntlet **24/24** (new
+tests/test_dict.rads: 12 self-checking cases — sabotage-verified the
+harness catches an injected wrong value); 6/6 transpiled fixtures
+byte-identical to CPython; ASAN clean on all dict paths (UBSAN too).
+Dict stress: 5k keys built+read in 0.13s. Commit bfc39f4, pushed to fork.
+
+**Known pre-existing issues (NOT from this run, verified on pristine
+sources via git stash):** (a) heap-buffer-overflow READ in
+`stdlib_struct.c:66` parse_value via struct.unpack (test_struct.rads
+passes functionally; ASAN flags the read); (b) bc_compile caches leak at
+exit (program-lifetime by design); (c) test.run() inside REPL-only flows
+never exits nonzero (fixed for file runs).
+
+**Next up (run 24): list comprehensions** — the second half of the
+journal's dict+comprehension scope: `[x*2 for x in xs]`,
+`[x for x in xs if x > 2]`, ideally dict comprehensions `{k: v for ...}`
+(now meaningful with VAL_DICT). Transpiler rules for `for k in d:` +
+`d.items()` unrolling in rads-mask. Fallback: GAPLIST high-value gaps
+(Phase 1 #3).
 
 ## What this run changed
 
