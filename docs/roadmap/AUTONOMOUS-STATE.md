@@ -1,78 +1,90 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 27)
+Last updated: 2026-10-15 (cron run 28)
 Branch: `phase0/build-recovery`
-HEAD: e71ed1a — test: REPL regression gate (run 27)
+HEAD: 30d3a9c — fix(memory): struct-literal orphan leak + uninit definition crashes
 
 ## What this run changed
 
-**Run 27 = journal "Next up": the REPL dangling func_node** — dead, and
-the dig found the corpse was worse than journalled: the REPL could not
-define functions AT ALL. Three corpses, one ownership class:
+**Run 28 = journal "Next up": the struct-literal orphan leak.** Dead — and,
+continuing the house tradition, the one journalled leak was four stacked
+corpses in the same ownership class. LSan differential on an identical
+probe (struct decl + 2 literals + enum + member access + str()): **script
+mode 172 B / 8 allocs → 0 / 0**; REPL mode 0 leaks, output correct.
 
-1. **REPL function registration** (`interpreter.c`): `exec_statement`
-   has no AST_FUNCTION_DECL case, so a `blast` line fell to default:,
-   was evaluated as a discarded VAL_FUNCTION expression and never
-   reached env_set — "Undefined function" on the very next call.
-   Registration was unreachable, which is why the journalled UAF had
-   never fired in practice. `interpret_repl_statement` now routes
-   AST_FUNCTION_DECL through `exec_function`, mirroring script-mode
-   interpret() Pass 1.
+1. **Per-literal StructDef orphan** (`interpreter.c:1609`): literal eval
+   malloc'd a fresh StructDef + strdup'd the name per literal; clones
+   share the pointer so value_release can never free it — orphaned
+   ~19 B per literal forever. The registry binding now owns the ONE
+   canonical StructDef (`def.name` aliases `binding->name`, freed once
+   with the binding); literals and clones BORROW it. find_struct →
+   find_struct_def returning `StructDef*`.
 
-2. **REPL struct/enum lines could not even PARSE** (`parser.c/.h`): the
-   REPL called parse_statement directly, which has no struct/enum route
-   ("Expected ';' after expression" on line 1). New public
-   `parse_repl_line()` wraps static `parse_declaration` — all top-level
-   forms (import/struct/enum/async/blast) plus every statement shape.
+2. **Parser identifier orphan** (`parser.c` parse_call): the struct-
+   literal branch overwrote `expr` (the leading identifier node, 64 B +
+   3 B name) without freeing it — one orphan per literal SITE, every
+   parse, REPL and script alike. Now creates the literal first, then
+   ast_free(expr) — order matters: `struct_name` aliases
+   `expr->identifier.name`, which ast_free releases.
 
-3. **The UAF itself** (`main.c`): with registration alive, the per-line
-   `ast_free(stmt)` dangled every func_node AND every struct/enum decl
-   node the persistent env/registries borrow (env_free_structs' comment
-   "owned by the main AST" is only true in script mode). Fixed with a
-   per-line AST arena: run_repl retains every parsed root and frees
-   them in bulk at shutdown, AFTER interpreter_cleanup_environment() —
-   safe because all borrowers are pure (value_release has no
-   VAL_FUNCTION case; env_free_structs/enums free only their binding
-   structs). **Negative control**: registration-without-arena build
-   reproduces the exact ASAN heap-use-after-free in bc_try_execute
-   (interpreter.c:3362 via eval_call → invoke_callee →
-   interpreter_execute_callback); full fix = clean.
+3. **Uninitialized `definition` → live SEGV** (4 stdlib creators):
+   datetime.now / csv parse rows / cli.run result / env.vars built
+   StructInstances and NEVER set `definition` — `echo str(datetime.now())`
+   dereferenced 0xbebebebebebebebe (UBSAN misaligned + ASAN SEGV,
+   reproduced on the pre-fix build). All four now set definition = NULL;
+   the two unguarded readers (value_to_string, member-error message)
+   label NULL defs "native". pprint already guarded. (Same corpse class
+   as run 26's regex.search fix — sweep was overdue.)
 
-4. **REPL regression gate** (`run_tests.sh`): feeds the REPL a probe via
-   stdin (struct decl, blast fns, calls, struct instance held across
-   lines, recursion fib(15)) and asserts outputs 5/arena/610 plus no
-   "Undefined function". ANSI color codes stripped before matching.
+4. **Script-mode registry leak** (`interpret()` tail): ended with
+   env_free() only — struct AND enum registry bindings (name strdup +
+   binding) leaked every script run as still-reachable globals LSan
+   doesn't flag by default. Teardown added: env_free → env_free_structs
+   → env_free_enums (registry after env so value_release never touches
+   a freed canonical def; same order as the REPL exit path). interpret()
+   has exactly one caller (main.c:584), so self-cleaning is safe.
 
-## Test results (run 27)
+## Test results (run 28)
 
-Clean rebuild, gauntlet **26/26 + new REPL gate**. ASAN full probe
-clean (struct instance + enum + recursion). Leak parity: 86 B / 4
-allocs leak IDENTICALLY in script mode on the same code (pre-existing
-struct-literal orphans, see hazards) — the arena adds zero new leaks.
-Pushed to fork: `0247539..e71ed1a` (9329354 engine fix, e71ed1a gate).
+Clean rebuild (plain), gauntlet **26/26 + REPL regression gate** green.
+Sanitize build: probe 0 leaks both modes; datetime.now() repro now exits
+0 printing `<struct instance native>`. Pushed to fork: `6b21627..30d3a9c`.
 
 ## Known hazards (noted, not fixed — pre-existing)
 
-- **Struct-literal orphan leak (86 B / 4 allocs per probe)**: `Pt {...}`
-  literals leak instance->definition->name strdup (interpreter.c:1609)
-  plus a 16 B eval orphan — identical in script AND REPL mode, so not
-  arena-related. Candidate for the next hygiene pass.
+- **stdlib_struct.c pack/unpack internals leak 146 B / 7 allocs** on
+  test_struct.rads under LSan (iter_unpack arrays 96 B + 48 B indirect,
+  parse_value strdup) — NOT touched this run; next up.
 - **REPL `import` sub-AST never freed**: exec_statement's import case
   parses the imported file and never ast_free(imported_ast) — same in
   script mode, pre-existing.
 - `turbo i32 c = GREEN;` echoes null — enum member resolution
   semantics, identical in script mode; not a REPL regression.
+- Native-return values leak engine-wide (run 25 baseline class) —
+  documented, tolerated.
 
 ## Next up (single task for next run)
 
-1. **Struct-literal orphan leak** (above): borrow a static definition
-   label (the regex.search run-26 pattern) instead of strdup-per-literal,
-   and chase the 16 B eval orphan at interpreter.c:1609. LSan
-   differential before/after on the same probe, script + REPL modes.
+1. **stdlib_struct.c leak sweep**: the 146 B / 7 alloc residue on
+   test_struct.rads (iter_unpack array_create + parse_value strdup
+   paths). Same method as this run: LSan differential before/after,
+   both modes, ownership mapped before freeing.
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
 vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 27 (previous run — summary retained below)
+
+REPL could not define functions at all (exec_statement had no
+AST_FUNCTION_DECL case) nor parse struct/enum lines (no declaration
+route) — the journalled UAF was unreachable because registration itself
+was dead. Three fixes: public parse_repl_line() over parse_declaration,
+interpret_repl_statement routes decls through exec_function, per-line AST
+arena freed in bulk after interpreter_cleanup_environment() (negative
+control reproduced the exact bc_try_execute UAF). New REPL regression
+gate in run_tests.sh (stdin probe, asserts 5/arena/610). Gauntlet 26/26 +
+gate. Commits 9329354, e71ed1a, 6b21627 on fork.
 
 ## Run 26 (previous run — summary retained below)
 
