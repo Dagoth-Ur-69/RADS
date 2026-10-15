@@ -1,10 +1,82 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 25)
+Last updated: 2026-10-15 (cron run 26)
 Branch: `phase0/build-recovery`
-HEAD: a6b0bd4 — test: runner hardening + stale-expectation refresh (run 25)
+HEAD: d518ac8 — fix: regex.replace overflow + search crash (run 26)
 
 ## What this run changed
+
+**Run 26 = journal "Next up": the exit-time BcFunc cache free** — dead, with
+a negative-control corpse for proof. Plus the same-run sibling sweep, which
+found two MORE memory-safety corpses in regex.
+
+1. **BcFunc bytecode-cache free** (`ast.c` + `interpreter.c` + `interpreter.h`):
+   every compiled function left its BcFunc allocation (56 bytes + code and
+   consts arrays) on `function_decl.bc_cache`, never freed at exit — the last
+   engine-wide leak class (documented run 24). `ast_free(AST_FUNCTION_DECL)`
+   now calls the opaque `interpreter_free_bc_cache(void*)`; NULL and the
+   `(void*)1` bail-out sentinel are ignored; `code`, strdup'd `consts`,
+   `call_sites` array (entries are borrowed AST pointers), and the struct are
+   freed. Safety argument: `value_release` has no VAL_FUNCTION case (function
+   values borrow `func_node`), so the program AST is the sole owner and
+   `ast_free` is the single teardown chokepoint; file mode frees env before
+   `ast_free(program)`. **Negative control**: 9-function probe, old build
+   under LSan = 1377 bytes leaked in 19 allocations (bc_compile:2804 et al),
+   patched build = zero.
+
+2. **regex.replace heap-buffer-overflow WRITE** (`stdlib_regex.c`): result
+   buffer sized by estimate `2*strlen + 2*repl_len` — overflowed on
+   all-match strings with multi-char replacements (`[0-9]` on "1111111111"
+   with "XYZ": needs 31, allocated 26). Reproduced under ASAN (strcpy
+   overflow) on pristine source. Rewritten as two-pass exact-size, same
+   shape as the run-25 str.replace fix.
+
+3. **regex.replace zero-width parity**: trailing empty match at EOS was
+   dropped — `re.sub(r'x*','-','abc')` is `-a-b-c-`, RADS returned
+   `-a-b-c`. Now probes for empty-match-at-EOS: full Python re.sub parity
+   including `a*` on "aaaa" → `--` and empty input → `-`.
+
+4. **regex.search uninitialized-pointer crash**: `StructInstance->definition`
+   was never set; printing a search result dereferenced garbage (0xbebebebe
+   SEGV in `value_to_string_impl` under ASAN). Fixed with a static borrowed
+   definition label — safe because `value_release` never frees `definition`.
+
+5. **tests/test_regex.rads** (module had NO test file): overflow-corpse
+   regression, zero-width parity, search-crash regression, findall/split/
+   match baselines via joins (array `==` is not deep in RADS — joined-string
+   comparison instead). Wired into `run_tests.sh` → gauntlet now 26 tests.
+
+## Test results (run 26)
+
+Clean rebuild, gauntlet **26/26** (test_regex new). A/B byte-identical BC vs
+`RADS_NO_BC=1` on test_regex. ASAN/UBSAN: regex tests clean (search crash
+repro'd before fix, gone after; overflow repro'd before fix, gone after).
+LSan differential on the BcFunc probe: old 1377 B / 19 allocs → new 0.
+Pushed to fork: `82f0003..d518ac8` (11d787b BcFunc free, d518ac8 regex fixes
++ test).
+
+## Known hazards (noted, not fixed — pre-existing)
+
+- **REPL dangling `func_node`**: `main.c` frees each line's AST while the
+  persistent env still holds `VAL_FUNCTION` values borrowing that AST's
+  `func_node` → any function defined in the REPL then called after its line's
+  `ast_free` is a use-after-free. Needs an ownership decision (per-line AST
+  arena kept alive until env teardown vs. deep-copying closures). Do NOT
+  treat REPL function definitions as safe until this is fixed.
+
+## Next up (single task for next run)
+
+1. **REPL dangling func_node fix** — decide ownership: per-line AST arena
+   (REPL keeps every line's AST alive until `interpreter_cleanup_environment`)
+   is the smallest safe change; verify with ASAN repro (define fn in REPL,
+   call it after the next prompt, exit) before/after. This closes the last
+   known use-after-free class in the engine.
+
+Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
+ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
+vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 25 (previous run — summary retained below)
 
 **Run 25 = journal "Next up": the struct.unpack heap-overflow READ.** Dead,
 with a reproduced corpse for proof.
@@ -42,7 +114,7 @@ with a reproduced corpse for proof.
    run 22 (`true→"True"`, `null→"None"`, nested strings quoted). Verified
    canonical via live binary + no test anywhere asserting old reprs.
 
-## Test results (run 25)
+## Run 25 test results (retained)
 
 Clean rebuild, gauntlet **25/25** on the hardened runner. A/B byte-identical
 BC vs `RADS_NO_BC=1` on test_struct, test_string, test_str_array. ASAN+
@@ -53,19 +125,6 @@ refcount bump so nested struct arrays follow engine convention, no
 double-free). Negative control: old source + ASAN = heap-buffer-overflow at
 stdlib_struct.c:66. Pushed to fork: `17036f8..a6b0bd4` (9ed130b fix,
 8908e20 str.replace, a6b0bd4 tests+runner).
-
-## Next up (single task for next run)
-
-1. **Exit-time BcFunc cache free** (LSan hygiene, kills the 56-byte-per-
-   function leak class documented in run 24) — the only remaining known
-   engine-wide leak class worth a dedicated run.
-2. Then (same run if it goes fast): sweep the other stdlib natives for the
-   single-pass replace / first-match-only pattern (str.replace's siblings —
-   check `string_advanced`, `textwrap`, `regex` modules).
-
-Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
-ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
-vs tree-walker output byte-for-byte, `git push fork` only.
 
 ## Run 24 (previous run — summary retained below)
 
