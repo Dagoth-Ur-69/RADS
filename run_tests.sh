@@ -41,6 +41,7 @@ test_files=(
     "test_comprehension.rads"   # run 24: list & dict comprehensions
     "test_dict.rads"            # run 23: dicts (was never wired into the runner)
     "test_str_array.rads"
+    "test_regex.rads"            # run 26: regex.replace overflow + zero-width parity, search uninit crash
     "test_v0.0.12.rads"
     "test_http.rads"
 )
