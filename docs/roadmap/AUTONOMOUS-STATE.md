@@ -1,81 +1,85 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 24)
+Last updated: 2026-10-15 (cron run 25)
 Branch: `phase0/build-recovery`
-HEAD: 6573c65 — feat(core): list & dict comprehensions (run 24)
+HEAD: a6b0bd4 — test: runner hardening + stale-expectation refresh (run 25)
 
 ## What this run changed
 
-**Run 24 = journal "Next up": list & dict comprehensions.** `[x*2 for x in
-xs if c]` and `{k: v for x in xs}` in both execution paths, Python
-semantics; the RADS-native `cruise` spelling (`[x cruise x in xs]`) works
-too (the lexer's `for`→TOKEN_CRUISE alias did the heavy lifting — zero
-lexer changes needed).
+**Run 25 = journal "Next up": the struct.unpack heap-overflow READ.** Dead,
+with a reproduced corpse for proof.
 
-1. **AST**: `AST_COMPREHENSION_EXPR` with a flat clause list of
-   `AST_COMP_FOR`/`AST_COMP_IF` nodes — multiple for-clauses are ONE loop
-   nest (`[v for row in grid for v in row]` flattens), filters guard the
-   rest of the chain. Creators + ast_free cases in ast.c/ast.h.
+1. **struct memory safety** (`stdlib_struct.c`, full rewrite of the data
+   path): `pack`/`pack_into` returned binary through `make_string(strdup)`,
+   truncating at the first NUL — `pack(">i",42)` produced a 1-byte string;
+   `unpack`/`unpack_from`/`iter_unpack` then read past that allocation
+   (heap-buffer-overflow READ at `stdlib_struct.c:66`). New contract,
+   mirroring `list(struct.pack(...))` in Python 3: **binary = array of byte
+   ints (0-255)**; unpack family accepts byte-int arrays or strings; every
+   read bounds-checked against real data length; `pack_into` zero-fill
+   grows, negative offsets rejected; `iter_unpack` floors partial trailing
+   records. **Negative control**: pristine source under ASAN reproduces
+   `heap-buffer-overflow stdlib_struct.c:66 in parse_value`; fixed source
+   clean. Gauntlet struct test expanded to 40+ checks (exact byte counts/
+   contents, 64-bit two's complement, char fmt, string input, growth,
+   short-buffer error paths returning null).
 
-2. **Tree-walker**: `eval_comprehension_clauses` recursion mirrors the
-   cruise statement's ownership rules exactly (iterable evaluated once,
-   strings strdup'd, nested arrays shared with refcount bump, env_set
-   binding — loop var leaks to enclosing scope, documented cruise
-   semantics). Non-array iterables → zero iterations, no error. Dict emit
-   goes through `dict_store` = upsert, last duplicate key wins.
+2. **str.replace Python parity bug** (`stdlib_string.c`): replaced only the
+   FIRST occurrence — `str.replace("a-b-c","-","+")` → `"a+b-c"`. Rewrote
+   as two-pass splice replacing ALL occurrences.
 
-3. **Bytecode VM**: comprehension compiles to an inline loop nest with
-   hidden slots (`$comp_out$/iter/n/i` + nesting-depth suffix so nested
-   comps never collide). Three opcodes: `BC_ALEN` (array length), 
-   `BC_APPEND` (move, no clone — mirrors the tree-walker's push+free net
-   effect), `BC_DSTORE` (dict_store upsert). Loop vars use
-   bc_slot_of/bc_new_slot exactly like cruise. No bc_open_loop needed —
-   nothing inside can break/continue.
+3. **Test runner hardening** (`run_tests.sh`): it judged pass/fail by exit
+   code alone, but RADS `assert()` prints to stderr and returns 0/1
+   WITHOUT aborting — every failing assertion was invisible; tests with
+   failing asserts still PASSED. Runner now also fails on
+   `"Assertion failed"` in output. Honest gauntlet = 25/25.
 
-4. **Dict literal grammar widened (carefully)**: keys parse as full
-   expressions now, so `{str(i) + "k": v}` computed keys work. Legacy
-   shapes preserved via 2-token lookahead: string keys and bare-identifier
-   keys still mean their literal NAME. **Bug found & fixed en route**: the
-   old identifier-key path had a dangling `free(key)` (key_ident_name
-   pointed into freed memory) — manifesting as garbage `{"": rads}` keys
-   and a segfault in test_cruise_array; also peek2_next_types was used
-   off-by-one (it returns tokens AFTER parser->current — pair with
-   check()). Dict comps with identifier keys evaluate the VARIABLE
-   (`{w: w.len for w in ws}` → Python semantics).
+4. **Stale-expectation refresh** (hidden by the blind runner, not
+   regressions): `test_string.rads` — contains/starts_with/ends_with/
+   is_empty return bool (`== 1/0` → `== true/false`); substring is
+   end-exclusive (Python slice), self-contradictory `"ell"` expectation
+   fixed. `test_str_array.rads` — `str()` uses Python-exact reprs since
+   run 22 (`true→"True"`, `null→"None"`, nested strings quoted). Verified
+   canonical via live binary + no test anywhere asserting old reprs.
 
-5. **Tests**: `tests/test_comprehension.rads` — 20 checks (basics, filter,
-   cruise spelling, dict comps, last-wins upsert, computed keys, flatten,
-   comp-of-comp, nested filter, env_set leak, outer-var refs, non-array
-   iterables, dict-literal regression, functions returning comps, call-
-   result iterables, empty dict comp, comp-as-call-arg). **A/B identical**
-   BC vs RADS_NO_BC=1 on all of them. Also **wired run-23's orphaned
-   test_dict.rads** into run_tests.sh — it existed but was referenced
-   nowhere (run 23's "24/24" counted a manual run, not the gauntlet).
+## Test results (run 25)
 
-6. **Sanitizer**: no NEW leak classes from run 24 (comprehension paths
-   clean beyond the pre-existing pattern). Documented pre-existing rot:
-   **every BC-compiled function leaks its 56-byte BcFunc + string consts
-   at exit** (function cache never freed) — verified on a comprehension-
-   free program on the pristine tree too. Candidate for a dedicated run.
-
-## Test results (run 24)
-
-Clean rebuild (`make clean && make -j`), gauntlet **25/25** (23 legacy +
-test_comprehension + newly-wired test_dict). A/B byte-identical. ASAN+
-UBSAN+LSan build green on all comprehension probes; leak report limited
-to the pre-existing BcFunc-cache pattern. Pushed to fork: `aa026ab..6573c65`.
+Clean rebuild, gauntlet **25/25** on the hardened runner. A/B byte-identical
+BC vs `RADS_NO_BC=1` on test_struct, test_string, test_str_array. ASAN+
+UBSAN+LSan: struct/string tests clean of any NEW leak class (native-return
+values leak engine-wide, baseline `str.split` leaks identically — same
+documented class as the BcFunc 56-byte exit leak; `array_push` clones with
+refcount bump so nested struct arrays follow engine convention, no
+double-free). Negative control: old source + ASAN = heap-buffer-overflow at
+stdlib_struct.c:66. Pushed to fork: `17036f8..a6b0bd4` (9ed130b fix,
+8908e20 str.replace, a6b0bd4 tests+runner).
 
 ## Next up (single task for next run)
 
-1. **Fix the struct.unpack heap-overflow READ** (`stdlib_struct.c:66`,
-   documented in run 23, pristine-source verified via stash) — highest
-   priority, it's a real memory-safety bug.
-2. Then (same run if it goes fast): exit-time BcFunc cache free (LSan
-   hygiene, kills the 56-byte/function leak class).
+1. **Exit-time BcFunc cache free** (LSan hygiene, kills the 56-byte-per-
+   function leak class documented in run 24) — the only remaining known
+   engine-wide leak class worth a dedicated run.
+2. Then (same run if it goes fast): sweep the other stdlib natives for the
+   single-pass replace / first-match-only pattern (str.replace's siblings —
+   check `string_advanced`, `textwrap`, `regex` modules).
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
 vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 24 (previous run — summary retained below)
+
+**Run 24 = list & dict comprehensions.** `[x*2 for x in xs if c]` and `{k: v
+for x in xs}` in both execution paths, Python semantics; RADS-native
+`cruise` spelling works too. AST_COMPREHENSION_EXPR + flat clause list
+(multi-for flattens into one loop nest, filters guard the chain); tree-
+walker recursion mirroring cruise ownership rules; VM inline loop nest with
+BC_ALEN/BC_APPEND/BC_DSTORE. Dict-literal grammar widened (computed keys),
+two corpses fixed en route (dangling free in identifier-key path, off-by-one
+peek2_next_types misuse). Wired run-23's orphaned test_dict.rads into the
+gauntlet. Clean rebuild, gauntlet 25/25, A/B byte-identical, no new leak
+classes (BcFunc cache leak pre-existing, documented). Pushed:
+`aa026ab..6573c65`.
 
 ## Open blockers
 
