@@ -222,6 +222,12 @@ static ASTNode* parse_declaration(Parser* parser);
 static ASTNode* parse_comparison(Parser* parser);
 static ASTNode* parse_block(Parser* parser);
 
+// Run 27: REPL entry point. The REPL previously called parse_statement
+// directly, which has no struct/enum route — a `struct Pt {...}` line died
+// with "Expected ';' after expression". parse_declaration handles all
+// top-level forms (import/struct/enum/async/blast) and falls through to
+// parse_statement for everything else, exactly the REPL contract.
+
 // Decode C-style escapes in a string literal body (between the quotes).
 // The RADS lexer keeps escapes raw ("a\nb" lexes as 4 chars a,\,n,b) — this
 // turns them into real control characters at parse time, like C/Python/JS.
@@ -1306,6 +1312,13 @@ static ASTNode* parse_declaration(Parser* parser) {
     
     // Let's handle statements
     return parse_statement(parser);
+}
+
+// Parse declaration — public REPL entry (run 27): top-level forms that
+// parse_statement cannot express (struct/enum/import/blast) parse here;
+// everything else delegates down to parse_statement unchanged.
+ASTNode* parse_repl_line(Parser* parser) {
+    return parse_declaration(parser);
 }
 
 // Parse statement - Public for REPL

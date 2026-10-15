@@ -350,6 +350,19 @@ int run_repl() {
     stdlib_register_all();
     int line_num = 1;
 
+    // Run 27: per-line AST arena. The persistent environment borrows AST
+    // nodes across lines: VAL_FUNCTION stores func_node, and the struct /
+    // enum registries store the decl node (env_free_structs/enums never
+    // free them — "owned by the main AST", true in script mode, a lie in
+    // REPL mode where ast_free(stmt) ran per line and dangled every
+    // registration). The REPL is the "main AST" now: every parsed root is
+    // retained here and freed only at shutdown, AFTER the environment and
+    // registries are torn down (all pure borrowers — value_release has no
+    // VAL_FUNCTION case, registries free only their binding structs).
+    ASTNode** repl_ast_arena = NULL;
+    size_t repl_ast_count = 0;
+    size_t repl_ast_capacity = 0;
+
     // RGB Chroma color cycle for prompt (like RGB keyboard)
     const char* chroma_colors[] = {
         COLOR_BRIGHT_MAGENTA,
@@ -453,7 +466,7 @@ int run_repl() {
         // Parse
         Parser parser;
         parser_init(&parser, &lexer);
-        ASTNode* stmt = parse_statement(&parser);
+        ASTNode* stmt = parse_repl_line(&parser);
 
         if (stmt == NULL || parser.had_error) {
             // Error already printed by parser
@@ -465,8 +478,20 @@ int run_repl() {
         // Execute statement in REPL context (preserves environment)
         interpret_repl_statement(stmt);
 
-        // Cleanup AST and source (environment persists)
-        ast_free(stmt);
+        // Run 27: retain the root — the environment may borrow nodes from
+        // it (func_node / struct / enum decls). Freed in bulk at shutdown.
+        if (repl_ast_count == repl_ast_capacity) {
+            repl_ast_capacity = repl_ast_capacity ? repl_ast_capacity * 2 : 16;
+            repl_ast_arena = realloc(repl_ast_arena, repl_ast_capacity * sizeof(ASTNode*));
+            if (!repl_ast_arena) {
+                fprintf(stderr, "rads: out of memory retaining REPL AST\n");
+                ast_free(stmt);
+                free(source);
+                return 1;
+            }
+        }
+        repl_ast_arena[repl_ast_count++] = stmt;
+
         free(source);
 
         line_num++;
@@ -480,6 +505,13 @@ int run_repl() {
     // Clean up environment and event loop on exit
     interpreter_cleanup_environment();
     interpreter_cleanup_event_loop();
+
+    // Run 27: now that every borrower (env values, struct/enum registries)
+    // is gone, release the retained AST roots.
+    for (size_t i = 0; i < repl_ast_count; i++) {
+        ast_free(repl_ast_arena[i]);
+    }
+    free(repl_ast_arena);
     return 0;
 }
 

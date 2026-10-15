@@ -3512,6 +3512,17 @@ int interpret_repl_statement(ASTNode* stmt) {
         return 1;
     }
 
+    // Run 27: REPL function registration. exec_statement has no
+    // AST_FUNCTION_DECL case — a `blast` line fell through to default:,
+    // was evaluated as a discarded VAL_FUNCTION expression, and never
+    // reached env_set. Result: "Undefined function" on the very next
+    // call. Script mode registers in interpret() Pass 1 via exec_function;
+    // mirror that here so the REPL can define functions at all.
+    if (stmt->type == AST_FUNCTION_DECL) {
+        exec_function(stmt);
+        return 0;
+    }
+
     // Execute the statement directly
     // Environment persists across calls for REPL
     exec_statement(stmt);
