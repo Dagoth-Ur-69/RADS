@@ -38,6 +38,8 @@ test_files=(
     "test_time.rads"
     "test_struct.rads"
     "test_cruise_array.rads"
+    "test_comprehension.rads"   # run 24: list & dict comprehensions
+    "test_dict.rads"            # run 23: dicts (was never wired into the runner)
     "test_str_array.rads"
     "test_v0.0.12.rads"
     "test_http.rads"

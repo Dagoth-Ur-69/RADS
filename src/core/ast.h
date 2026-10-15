@@ -55,6 +55,9 @@ typedef enum {
     AST_SPREAD_EXPR,
     AST_OPTIONAL_CHAIN,
     AST_NULLISH_COALESCING,
+    AST_COMPREHENSION_EXPR, // run 24: [e for x in xs if c] / {k: v for ...}
+    AST_COMP_FOR,           // clause: <var> in <iterable>
+    AST_COMP_IF,            // clause: <condition>
     
     // Destructuring patterns
     AST_DESTRUCTURE_ARRAY,
@@ -267,6 +270,28 @@ struct ASTNode {
             ASTList* elements;
             bool is_dict; // true when parsed from {"k": v} — kv payload
         } array_literal;
+
+        // Comprehension (run 24): [e for x in xs if c] / {k: v for x in xs}.
+        // Clauses are a flat list of AST_COMP_FOR / AST_COMP_IF nodes so a
+        // nested comprehension [y for x in xss for y in x] is one node with
+        // two for-clauses (one loop nest), not nested comprehension nodes.
+        struct {
+            ASTNode* expr;     // element expr (list) or value expr (dict)
+            ASTNode* key_expr; // dict only: key expr; NULL for list comps
+            ASTList* clauses;
+            bool is_dict;
+        } comprehension;
+
+        // Comprehension clause: <var> in <iterable>
+        struct {
+            char* iterator;
+            ASTNode* iterable;
+        } comp_for;
+
+        // Comprehension clause: <condition>
+        struct {
+            ASTNode* condition;
+        } comp_if;
         
         // Index expression
         struct {
@@ -352,6 +377,10 @@ ASTNode* ast_create_member_expr(ASTNode* object, const char* member, int line, i
 ASTNode* ast_create_struct_literal(const char* name, ASTList* fields, int line, int column);
 ASTNode* ast_create_array_literal(ASTList* elements, int line, int column);
 ASTNode* ast_create_dict_literal(ASTList* elements, int line, int column);
+// run 24: comprehension nodes. Takes ownership of expr/key_expr/clauses.
+ASTNode* ast_create_comprehension(ASTNode* expr, ASTNode* key_expr, ASTList* clauses, bool is_dict, int line, int column);
+ASTNode* ast_create_comp_for(const char* iterator, ASTNode* iterable, int line, int column);
+ASTNode* ast_create_comp_if(ASTNode* condition, int line, int column);
 ASTNode* ast_create_index(ASTNode* array, ASTNode* index, int line, int column);
 ASTNode* ast_create_assign(ASTNode* target, ASTNode* value, int line, int column);
 ASTNode* ast_create_cruise(const char* iterator, ASTNode* iterable, ASTNode* body, int line, int column);

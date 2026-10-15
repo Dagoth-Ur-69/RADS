@@ -311,6 +311,39 @@ ASTNode* ast_create_dict_literal(ASTList* elements, int line, int column) {
     return node;
 }
 
+// Run 24: comprehension nodes. Ownership of expr/key_expr/clauses moves in;
+// callers must not free them afterwards.
+ASTNode* ast_create_comprehension(ASTNode* expr, ASTNode* key_expr, ASTList* clauses, bool is_dict, int line, int column) {
+    ASTNode* node = malloc(sizeof(ASTNode));
+    node->type = AST_COMPREHENSION_EXPR;
+    node->line = line;
+    node->column = column;
+    node->comprehension.expr = expr;
+    node->comprehension.key_expr = key_expr;
+    node->comprehension.clauses = clauses;
+    node->comprehension.is_dict = is_dict;
+    return node;
+}
+
+ASTNode* ast_create_comp_for(const char* iterator, ASTNode* iterable, int line, int column) {
+    ASTNode* node = malloc(sizeof(ASTNode));
+    node->type = AST_COMP_FOR;
+    node->line = line;
+    node->column = column;
+    node->comp_for.iterator = strdup(iterator);
+    node->comp_for.iterable = iterable;
+    return node;
+}
+
+ASTNode* ast_create_comp_if(ASTNode* condition, int line, int column) {
+    ASTNode* node = malloc(sizeof(ASTNode));
+    node->type = AST_COMP_IF;
+    node->line = line;
+    node->column = column;
+    node->comp_if.condition = condition;
+    return node;
+}
+
 ASTNode* ast_create_index(ASTNode* array, ASTNode* index, int line, int column) {
     ASTNode* node = malloc(sizeof(ASTNode));
     node->type = AST_INDEX_EXPR;
@@ -512,6 +545,18 @@ void ast_free(ASTNode* node) {
             break;
         case AST_ARRAY_LITERAL:
             ast_list_free(node->array_literal.elements);
+            break;
+        case AST_COMPREHENSION_EXPR: // run 24
+            ast_free(node->comprehension.expr);
+            ast_free(node->comprehension.key_expr);
+            ast_list_free(node->comprehension.clauses);
+            break;
+        case AST_COMP_FOR:
+            free(node->comp_for.iterator);
+            ast_free(node->comp_for.iterable);
+            break;
+        case AST_COMP_IF:
+            ast_free(node->comp_if.condition);
             break;
         case AST_INDEX_EXPR:
             ast_free(node->index_expr.array);

@@ -253,6 +253,44 @@ static char* decode_string_escapes(const char* src, size_t len) {
 }
 
 // Parse primary expressions
+// Run 24: the clause tail of a comprehension —
+//   ('for'/'cruise') IDENT 'in' expr ('if' expr)* , repeated for nesting:
+//   [y for x in xss for y in x if y > 2]
+// 'for' arrives as TOKEN_CRUISE (pythonic lexer alias), 'if' as TOKEN_IF.
+// No ternary exists in RADS, so an 'if' in clause position can only be a
+// filter clause — expressions never continue with TOKEN_IF/TOKEN_CRUISE.
+static ASTList* parse_comprehension_clauses(Parser* parser) {
+    ASTList* clauses = ast_list_create();
+    while (check(parser, TOKEN_CRUISE) || check(parser, TOKEN_IF)) {
+        if (match(parser, TOKEN_CRUISE)) {
+            int line = parser->previous.line;
+            int column = parser->previous.column;
+            consume(parser, TOKEN_IDENTIFIER, "Expected loop variable after 'for' in comprehension");
+            char* var = malloc(parser->previous.length + 1);
+            if (!var) { ast_list_free(clauses); return NULL; }
+            memcpy(var, parser->previous.start, parser->previous.length);
+            var[parser->previous.length] = '\0';
+            consume(parser, TOKEN_IN, "Expected 'in' after comprehension loop variable");
+            ASTNode* iterable = parse_expression(parser);
+            if (!iterable) { free(var); ast_list_free(clauses); return NULL; }
+            ASTNode* cf = ast_create_comp_for(var, iterable, line, column);
+            free(var);
+            if (!cf) { ast_list_free(clauses); return NULL; }
+            ast_list_append(clauses, cf);
+        } else {
+            match(parser, TOKEN_IF);
+            int line = parser->previous.line;
+            int column = parser->previous.column;
+            ASTNode* cond = parse_expression(parser);
+            if (!cond) { ast_list_free(clauses); return NULL; }
+            ASTNode* ci = ast_create_comp_if(cond, line, column);
+            if (!ci) { ast_list_free(clauses); return NULL; }
+            ast_list_append(clauses, ci);
+        }
+    }
+    return clauses;
+}
+
 static ASTNode* parse_primary(Parser* parser) {
     if (match(parser, TOKEN_INTEGER)) {
         char* end;
@@ -313,6 +351,13 @@ static ASTNode* parse_primary(Parser* parser) {
         int column = parser->previous.column;
         ASTList* elements = ast_list_create();
         if (!check(parser, TOKEN_RIGHT_BRACKET)) {
+            // Run 24: list comprehension [e for x in xs if c]. The element
+            // expression is parsed first; a following 'for'/'cruise' turns
+            // the whole thing into a comprehension node instead of a literal.
+            // ('for' lexes as TOKEN_CRUISE via the pythonic alias — an
+            // expression can never continue with it, so one token of
+            // lookahead after the first element is unambiguous.)
+            bool first = true;
             do {
                 if (match(parser, TOKEN_DOT_DOT_DOT)) {
                     int spread_line = parser->previous.line;
@@ -320,9 +365,20 @@ static ASTNode* parse_primary(Parser* parser) {
                     ASTNode* expr = parse_expression(parser);
                     ASTNode* spread = ast_create_spread(expr, spread_line, spread_col);
                     if (spread) ast_list_append(elements, spread);
+                    first = false;
                 } else {
                     ASTNode* elem = parse_expression(parser);
-                    if (elem) ast_list_append(elements, elem);
+                    if (!elem) return NULL;
+                    if (first && check(parser, TOKEN_CRUISE)) {
+                        // [expr for ...] — comprehension, not a literal.
+                        ASTList* clauses = parse_comprehension_clauses(parser);
+                        ast_list_free(elements); // empty — the expr moved out
+                        if (!clauses) { ast_free(elem); return NULL; }
+                        consume(parser, TOKEN_RIGHT_BRACKET, "Expected ']' after comprehension");
+                        return ast_create_comprehension(elem, NULL, clauses, false, line, column);
+                    }
+                    ast_list_append(elements, elem);
+                    first = false;
                 }
             } while (match(parser, TOKEN_COMMA));
         }
@@ -347,25 +403,69 @@ static ASTNode* parse_primary(Parser* parser) {
         ASTList* elements = ast_list_create();
         if (!check(parser, TOKEN_RIGHT_BRACE)) {
             do {
-                char* key = NULL;
-                if (match(parser, TOKEN_STRING)) {
+                // Run 24: keys parse as full expressions now, so computed
+                // keys {str(i) + "k": v} and comprehensions
+                // {k_expr: v_expr for x in xs} share one path. The two
+                // legacy shapes — string keys and bare-identifier keys
+                // (evaluated to their NAME, matching pre-run-24 literals)
+                // — are recognized by 2-token lookahead before committing.
+                ASTNode* key_node = NULL;
+                bool key_was_ident = false;
+                const char* key_ident_name = NULL;
+                TokenType t1, t2;
+                peek2_next_types(parser, &t1, &t2);
+                // NOTE: peek2_next_types returns the two tokens AFTER
+                // parser->current — pair it with check() for the current
+                // token. Legacy string key: STRING ':' …
+                if (check(parser, TOKEN_STRING) && t1 == TOKEN_COLON) {
+                    match(parser, TOKEN_STRING);
                     size_t len = parser->previous.length - 2;
-                    key = decode_string_escapes(parser->previous.start + 1, len);
-                } else if (match(parser, TOKEN_IDENTIFIER)) {
-                    key = malloc(parser->previous.length + 1);
+                    char* key = decode_string_escapes(parser->previous.start + 1, len);
+                    key_node = ast_create_string(key, parser->previous.line, parser->previous.column);
+                    free(key);
+                } else if (check(parser, TOKEN_IDENTIFIER) && t1 == TOKEN_COLON) {
+                    match(parser, TOKEN_IDENTIFIER);
+                    char* key = malloc(parser->previous.length + 1);
                     memcpy(key, parser->previous.start, parser->previous.length);
                     key[parser->previous.length] = '\0';
+                    key_node = ast_create_string(key, parser->previous.line, parser->previous.column);
+                    // If this turns out to be a comprehension ({w: w.len for
+                    // w in words}), the key must evaluate the VARIABLE w per
+                    // iteration, not the literal name. Deferred decision —
+                    // the 'for' only appears after the value expression, so
+                    // ownership of `key` stays here until the branch resolves.
+                    key_was_ident = true;
+                    key_ident_name = key;
                 } else {
-                    error(parser, "Expected string or identifier as map key");
-                    return NULL;
+                    key_node = parse_expression(parser);
                 }
-                ASTNode* key_node = ast_create_string(key, parser->previous.line, parser->previous.column);
-                ast_list_append(elements, key_node);
-                free(key);
-
+                if (!key_node) { if (key_was_ident) free((void*)key_ident_name); return NULL; }
                 consume(parser, TOKEN_COLON, "Expected ':' after map key");
                 ASTNode* val = parse_expression(parser);
-                if (val) ast_list_append(elements, val);
+                if (!val) {
+                    ast_free(key_node);
+                    if (key_was_ident) free((void*)key_ident_name);
+                    return NULL;
+                }
+                if (elements->count == 0 && check(parser, TOKEN_CRUISE)) {
+                    // {k: v for ...} — dict comprehension.
+                    if (key_was_ident) {
+                        // re-key: bare identifier means the loop variable's
+                        // VALUE, matching Python ({w: ... for w in ...}).
+                        ast_free(key_node);
+                        key_node = ast_create_identifier(key_ident_name, line, column);
+                        free((void*)key_ident_name);
+                        key_was_ident = false;
+                    }
+                    ASTList* clauses = parse_comprehension_clauses(parser);
+                    ast_list_free(elements); // empty — k/v moved out
+                    if (!clauses) { ast_free(key_node); ast_free(val); return NULL; }
+                    consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after dict comprehension");
+                    return ast_create_comprehension(val, key_node, clauses, true, line, column);
+                }
+                ast_list_append(elements, key_node);
+                ast_list_append(elements, val);
+                if (key_was_ident) free((void*)key_ident_name);
             } while (match(parser, TOKEN_COMMA));
         }
         consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after map literal");

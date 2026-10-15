@@ -1320,6 +1320,77 @@ static Value eval_binary_op(ASTNode* node) {
 }
 
 // Evaluate expression
+// Run 24: comprehension evaluation. Walks the flat clause list as a loop
+// nest (clause k's body is clause k+1, innermost body emits the element).
+// Mirrors the cruise statement's observable ownership rules exactly:
+// iterable evaluated ONCE before its loop; element binding duplicates
+// strings, shares nested arrays with a refcount bump, copies scalars.
+// List comps append into a fresh array; dict comps dict_store (upsert,
+// last key wins) into a fresh dict-tagged payload. Non-array iterables
+// produce zero iterations (cruise semantics), not an error.
+static void eval_comprehension_clauses(ASTNode* comp, size_t ci, Array* out) {
+    if (ci >= comp->comprehension.clauses->count) {
+        // innermost: emit
+        if (comp->comprehension.is_dict) {
+            Value k = eval_expression(comp->comprehension.key_expr);
+            Value v = eval_expression(comp->comprehension.expr);
+            Value res = dict_store(out, &k, &v, true); // stores its own clone
+            value_free(&res);
+            value_free(&k);
+            value_free(&v);
+        } else {
+            Value v = eval_expression(comp->comprehension.expr);
+            array_push(out, v); // clones
+            value_free(&v);
+        }
+        return;
+    }
+    ASTNode* clause = comp->comprehension.clauses->nodes[ci];
+    if (clause->type == AST_COMP_IF) {
+        Value cond = eval_expression(clause->comp_if.condition);
+        bool pass = is_truthy(cond);
+        value_free(&cond);
+        if (pass) eval_comprehension_clauses(comp, ci + 1, out);
+        return;
+    }
+    // AST_COMP_FOR
+    Value iterable_v = eval_expression(clause->comp_for.iterable);
+    if (iterable_v.type != VAL_ARRAY || !iterable_v.array_val) {
+        value_free(&iterable_v);
+        return; // zero iterations, cruise semantics
+    }
+    Array* arr = iterable_v.array_val;
+    arr->refcount++; // keep alive across body mutations/frees
+    for (size_t j = 0; j < arr->count; j++) {
+        Value elem = arr->items[j];
+        Value bound;
+        if (elem.type == VAL_STRING) {
+            bound = make_string(elem.string_val);
+        } else if (elem.type == VAL_ARRAY && elem.array_val) {
+            elem.array_val->refcount++;
+            bound = elem;
+        } else if (elem.type == VAL_DICT && elem.array_val) {
+            elem.array_val->refcount++;
+            bound = elem;
+        } else {
+            bound = elem;
+        }
+        env_set(clause->comp_for.iterator, bound); // env takes ownership
+        eval_comprehension_clauses(comp, ci + 1, out);
+    }
+    arr->refcount--;
+    value_free(&iterable_v);
+}
+
+static Value eval_comprehension(ASTNode* node) {
+    Array* out = array_create(4);
+    eval_comprehension_clauses(node, 0, out);
+    Value v;
+    v.type = node->comprehension.is_dict ? VAL_DICT : VAL_ARRAY;
+    v.array_val = out;
+    return v;
+}
+
 static Value eval_expression(ASTNode* node) {
     if (!node) return make_null();
     
@@ -1344,6 +1415,9 @@ static Value eval_expression(ASTNode* node) {
             }
             return v;
         }
+
+        case AST_COMPREHENSION_EXPR: // run 24
+            return eval_comprehension(node);
         
         case AST_INDEX_EXPR: {
             Value arr = eval_expression(node->index_expr.array);
@@ -2030,6 +2104,9 @@ typedef enum {
     BC_CALLM,    // dotted call: imm u8 argc, u16 site, u16 full-name idx, u16 member idx (round 7)
     BC_SLOT_BIN, // imm: u16 slot, u8 op — local[slot] = local[slot] <op> TOS, in place (round 8)
     BC_GETIDX,   // pop idx, arr; push arr[idx] clone (round 9 — mirrors eval index path)
+    BC_ALEN,     // pop array/dict, push int count (run 24 — comprehension loop bound)
+    BC_APPEND,   // imm: u16 slot — pop value; append into local[slot] array (run 24)
+    BC_DSTORE,   // imm: u16 slot — pop value, key; dict_store into local[slot] dict (run 24)
     BC_CMPF      // imm: u16 slot, u8 op, i64 rhs, u16 abs offset — fused compare-and-branch:
                  // if !(local[slot] <op> rhs) jump. No stack traffic, no clone (round 10).
                  // Mirrors GETL+INT+BIN(op)+JMPF exactly for int slots; non-int slots
@@ -2080,6 +2157,7 @@ typedef struct BcCompiler {
     const char* slot_names[BC_MAX_SLOTS]; // interned via env_intern
     int nslots;
     BcLoopPatchList* loops; // innermost-open loop patch scope
+    int comp_depth; // run 24: comprehension nesting depth (unique hidden slots)
     bool ok; // false once any emit/compile error happens
 } BcCompiler;
 
@@ -2225,6 +2303,139 @@ static bool bc_try_cmpf(BcCompiler* c, ASTNode* cond, size_t* patch_at) {
     return true;
 }
 
+// Run 24 forwards — comprehension compilation is mutually recursive with
+// bc_compile_expr (element/key/filter expressions compile through it).
+static bool bc_compile_expr(BcCompiler* c, ASTNode* e);
+static bool bc_compile_comp_clauses(BcCompiler* c, ASTNode* comp, size_t ci, int depth, int out_slot);
+
+// Run 24: comprehension compilation. The flat clause list lowers to a loop
+// nest inline in the current function — same shape the tree-walker's
+// recursive eval_comprehension_clauses walks:
+//   <MKARR|MKDICT 0>; SETL_POP $out$
+//   clause k (for): <iterable>; SETL_POP $iter$; GETL $iter$; ALEN;
+//                   SETL_POP $n$; INT 0; SETL_POP $i$
+//     Lcond: GETL $i$; GETL $n$; BIN <; JMPF Lend
+//            GETL $iter$; GETL $i$; GETIDX; SETL_POP <var>
+//            [if-clause: <cond>; JMPF Lnext]  (Lnext = start of next clause
+//             or of the step; the filter only guards what follows it)
+//            (clause k+1 ... | emit)
+//            Lcont: INT 1; SLOT_BIN $i$ +; JMP Lcond
+//     Lend:
+//   emit: <E>; BC_APPEND $out$  |  <K>; <V>; BC_DSTORE $out$
+//   GETL $out$ (push result)
+// Hidden slot names carry the comp-depth suffix so nested comprehensions
+// ([[y for y in row] for row in m]) never collide. Loop vars use
+// bc_slot_of/bc_new_slot exactly like the cruise statement. No
+// bc_open_loop/bc_patch_loops: nothing inside a comprehension can
+// break/continue.
+static bool bc_compile_comp_clauses(BcCompiler* c, ASTNode* comp, size_t ci, int depth, int out_slot) {
+    if (ci >= comp->comprehension.clauses->count) {
+        // innermost: emit
+        if (comp->comprehension.is_dict) {
+            if (!bc_compile_expr(c, comp->comprehension.key_expr)) return false;
+            if (!bc_compile_expr(c, comp->comprehension.expr)) return false;
+            bc_put(c, BC_DSTORE);
+            bc_put16(c, (uint16_t)out_slot);
+        } else {
+            if (!bc_compile_expr(c, comp->comprehension.expr)) return false;
+            bc_put(c, BC_APPEND);
+            bc_put16(c, (uint16_t)out_slot);
+        }
+        return true;
+    }
+    ASTNode* clause = comp->comprehension.clauses->nodes[ci];
+    if (clause->type == AST_COMP_IF) {
+        // filter guards the REST of the clause chain (or the emit)
+        if (!bc_compile_expr(c, clause->comp_if.condition)) return false;
+        size_t jf = bc_emit_jump(c, BC_JMPF);
+        if (!bc_compile_comp_clauses(c, comp, ci + 1, depth, out_slot)) return false;
+        bc_patch_jump(c, jf);
+        return true;
+    }
+    // AST_COMP_FOR
+    if (!clause->comp_for.iterator) return false;
+    if (!bc_compile_expr(c, clause->comp_for.iterable)) return false;
+    char hidden[32];
+    snprintf(hidden, sizeof hidden, "$comp_iter$%d", depth);
+    int it_slot = bc_new_slot(c, hidden);
+    if (it_slot < 0) return false;
+    bc_put(c, BC_SETL_POP);
+    bc_put16(c, (uint16_t)it_slot);
+
+    bc_put(c, BC_GETL);
+    bc_put16(c, (uint16_t)it_slot);
+    bc_put(c, BC_ALEN);
+    snprintf(hidden, sizeof hidden, "$comp_n$%d", depth);
+    int n_slot = bc_new_slot(c, hidden);
+    if (n_slot < 0) return false;
+    bc_put(c, BC_SETL_POP);
+    bc_put16(c, (uint16_t)n_slot);
+
+    bc_put(c, BC_INT);
+    bc_put64(c, 0);
+    snprintf(hidden, sizeof hidden, "$comp_i$%d", depth);
+    int i_slot = bc_new_slot(c, hidden);
+    if (i_slot < 0) return false;
+    bc_put(c, BC_SETL_POP);
+    bc_put16(c, (uint16_t)i_slot);
+
+    size_t cond_at = c->len;
+    bc_put(c, BC_GETL);
+    bc_put16(c, (uint16_t)i_slot);
+    bc_put(c, BC_GETL);
+    bc_put16(c, (uint16_t)n_slot);
+    bc_put(c, BC_BIN);
+    bc_put(c, (uint8_t)OP_LT);
+    size_t jf = bc_emit_jump(c, BC_JMPF);
+
+    // body: var = iter[i]
+    bc_put(c, BC_GETL);
+    bc_put16(c, (uint16_t)it_slot);
+    bc_put(c, BC_GETL);
+    bc_put16(c, (uint16_t)i_slot);
+    bc_put(c, BC_GETIDX);
+    int v_slot = bc_slot_of(c, clause->comp_for.iterator);
+    if (v_slot < 0) v_slot = bc_new_slot(c, clause->comp_for.iterator);
+    if (v_slot < 0) return false;
+    bc_put(c, BC_SETL_POP);
+    bc_put16(c, (uint16_t)v_slot);
+
+    // rest of the chain (filters/loops/emit)
+    if (!bc_compile_comp_clauses(c, comp, ci + 1, depth, out_slot)) return false;
+
+    // step: i += 1; jmp cond
+    bc_put(c, BC_INT);
+    bc_put64(c, 1);
+    bc_put(c, BC_SLOT_BIN);
+    bc_put16(c, (uint16_t)i_slot);
+    bc_put(c, (uint8_t)OP_ADD);
+    bc_put(c, BC_JMP);
+    bc_put16(c, (uint16_t)cond_at);
+    bc_patch_jump(c, jf);
+    return true;
+}
+
+static bool bc_compile_comprehension(BcCompiler* c, ASTNode* e) {
+    int depth = c->comp_depth++;
+    // out container: fresh empty array/dict in a hidden slot
+    bc_put(c, e->comprehension.is_dict ? BC_MKDICT : BC_MKARR);
+    bc_put16(c, 0);
+    char hidden[32];
+    snprintf(hidden, sizeof hidden, "$comp_out$%d", depth);
+    int out_slot = bc_new_slot(c, hidden);
+    if (out_slot < 0) { c->comp_depth--; return false; }
+    bc_put(c, BC_SETL_POP);
+    bc_put16(c, (uint16_t)out_slot);
+
+    bool ok = bc_compile_comp_clauses(c, e, 0, depth, out_slot);
+    c->comp_depth--;
+    if (!ok) return false;
+
+    bc_put(c, BC_GETL);
+    bc_put16(c, (uint16_t)out_slot);
+    return true;
+}
+
 static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
     if (!e || !c->ok) return false;
     switch (e->type) {
@@ -2299,6 +2510,8 @@ static bool bc_compile_expr(BcCompiler* c, ASTNode* e) {
             bc_put16(c, (uint16_t)n);
             return true;
         }
+        case AST_COMPREHENSION_EXPR: // run 24
+            return bc_compile_comprehension(c, e);
         case AST_CALL_EXPR: {
             ASTNode* callee = e->call_expr.callee;
             size_t argc = e->call_expr.arguments ? e->call_expr.arguments->count : 0;
@@ -3019,6 +3232,55 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 value_free(&arr);
                 value_free(&idx);
                 BC_PUSH(result);
+                break;
+            }
+            case BC_ALEN: {
+                // Run 24: comprehension loop bound. Pop container, push int
+                // element count (dict count = payload slots = 2 * pairs —
+                // callers only use this on arrays, defensive for dicts).
+                Value a; BC_POP(a);
+                long long n = 0;
+                if (a.type == VAL_ARRAY || a.type == VAL_DICT) {
+                    n = (long long)(a.array_val ? a.array_val->count : 0);
+                }
+                value_free(&a);
+                BC_PUSH(make_int(n));
+                break;
+            }
+            case BC_APPEND: {
+                // Run 24: pop value, append (MOVED, no clone) into
+                // local[slot]'s array. The tree-walker's array_push clones,
+                // but its element value is freed right after — net effect
+                // "eval, move into out" — which is what this does directly.
+                uint16_t slot = ip[0] | (ip[1] << 8); ip += 2;
+                Value v; BC_POP(v);
+                Value* dst = &slots[slot];
+                if (dst->type == VAL_ARRAY && dst->array_val) {
+                    Array* a = dst->array_val;
+                    if (a->count >= a->capacity) {
+                        a->capacity = a->capacity ? a->capacity * 2 : 4;
+                        a->items = realloc(a->items, a->capacity * sizeof(Value));
+                    }
+                    a->items[a->count++] = v; // move
+                    v = make_null();         // consumed
+                }
+                value_free(&v); // defensive: no-op on the array path
+                break;
+            }
+            case BC_DSTORE: {
+                // Run 24: pop value, key; dict_store (upsert, last key wins)
+                // into local[slot]'s dict. Mirrors the tree-walker emit
+                // (dict_store stores its own clone; popped k/v are freed).
+                uint16_t slot = ip[0] | (ip[1] << 8); ip += 2;
+                Value v; BC_POP(v);
+                Value k; BC_POP(k);
+                Value* dst = &slots[slot];
+                if (dst->type == VAL_DICT && dst->array_val) {
+                    Value res = dict_store(dst->array_val, &k, &v, true);
+                    value_free(&res); // the clone dict_store returned
+                }
+                value_free(&k);
+                value_free(&v);
                 break;
             }
             case BC_SLOT_BIN: {
