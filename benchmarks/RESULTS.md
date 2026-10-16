@@ -7,27 +7,33 @@ wall-clock (process start included — that's the real cost a user pays).
 Run it yourself: `bash benchmarks/run.sh` (or `--quick` for best-of-1 smoke).
 Machine-readable results land in `benchmarks/results/*.json`.
 
-## Latest run — 2026-10-16 BC numeric fast-path (results/20261016T151125Z.json)
+## Latest run — 2026-10-16 BC_CALL direct dispatch (results/20261016T182438Z.json)
 
 | Workload | RADS (ms) | CPython 3.13 (ms) | Node 20 (ms) | Notes |
 |---|---:|---:|---:|---|
-| fib(28) naive recursion | 66.4 | **58.9** | 104.9 | 3050 → 275 → 186 → 136 → 101 → 71 → 72 → **66** (BC int/float direct dispatch); gap to CPython now 1.13x |
-| string_build (5000 concats) | 25.5 | **20.5** | 101.1 | flat (concat path untouched) |
-| array_churn (20k push + 5k pop + map) | **10.1** | 14.5 | 106.1 | best-ever RADS number on this workload |
-| file_io (200 write/read/append cycles) | **22.1** | 37.1 | 120.2 | RADS wins — native stdlib I/O |
+| fib(28) naive recursion | 63.3 | **62.3** | 120.2 | 3050 → 275 → 186 → 136 → 101 → 71 → 72 → 66 → **63** (BC_CALL now dispatches vm_run directly + trivially-copyable param binding); gap to CPython now **1.016x — statistical parity** |
+| string_build (5000 concats) | 26.7 | **22.7** | 112.6 | flat (concat path untouched) |
+| array_churn (20k push + 5k pop + map) | **11.1** | 15.7 | 113.0 | steady |
+| file_io (200 write/read/append cycles) | **22.3** | 40.7 | 134.2 | RADS wins — native stdlib I/O |
 
 Takeaways, honestly stated:
 
-- gprof (first profiler run on this repo) showed `binop_apply` at ~1.03M
-  calls for fib(28) — the `n-1`/`n-2` SUB ops had no bytecode fast path.
-  This run adds direct int/float dispatch for all non-ADD ops in BC_BIN,
-  mirroring `binop_apply` lane-for-lane. A/B (interleaved, 7 samples):
-  68.3 → 63.4 ms median, ~7% with zero distribution overlap.
-- fib is now within 1.13x of CPython (was 1.20x). string_build unchanged.
-  The remaining fib profile heat is BC_CALL: per-call env entry interning
-  (arg name), arg value cloning, and callee resolution — the next lever.
-- RADS beats CPython on **2 of 4**, Node on **4 of 4** — same scoreboard,
-  the fib loss narrowed.
+- Fresh gprof (run 37): the BC_CALL path walked a 4-deep trampoline
+  (`BC_CALL → invoke_callee → interpreter_execute_callback →
+  bc_try_execute → vm_run`) **1,028,458 times** for fib(28), plus
+  `value_clone_impl` 1.03M (unconditional arg clone) and
+  `env_intern_entry` 1.03M (arg-name interning at bind time).
+- This run removes the trampoline: BC_CALL now reaches `vm_run` directly
+  for user functions (natives keep their exact path), and `vm_run`'s
+  param binding fast-paths trivially copyable types (INT/FLOAT/BOOL/
+  NULL/FUNCTION — exact mirror of the existing BC_GETL rule).
+- A/B (interleaved, 5 rounds × 3 samples): 71.4 → 63.8 ms median
+  (~10.8%), non-overlapping distributions.
+- The stale run-36 `bc_put16 ≈ 1.03M` anomaly is resolved: compile runs
+  once per function; no per-call recompilation exists.
+- RADS beats CPython on **2 of 4**, Node on **4 of 4** — and the fib gap
+  is gone: 1.016x on the stable-load run. The next honest frontier is
+  beating CPython on fib outright, then string_build (concat cost).
 
 ## Latest run — 2026-10-16 post-enum-values refresh (results/20261016T120234Z.json, confirmed by 120329Z)
 

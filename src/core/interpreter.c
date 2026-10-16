@@ -2227,6 +2227,10 @@ typedef struct BcFunc {
     int nparams;
 } BcFunc;
 
+// Lazy-compile helper shared by bc_try_execute and the BC_CALL fast path
+// (perf round 5). Defined after BcFunc; used by vm_run below.
+static BcFunc* bc_func_for(ASTNode* func);
+
 typedef struct BcCompiler {
     uint8_t* code;
     size_t len, cap;
@@ -2931,7 +2935,19 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
 
     for (int i = 0; i < f->nslots; i++) slots[i] = make_null();
     for (int i = 0; i < f->nparams; i++) {
-        slots[i] = (i < argc && args) ? value_clone_impl(args[i]) : make_null();
+        // Fast path: trivially copyable types (exact mirror of the BC_GETL
+        // rule and value_clone_impl's behavior for these types — a plain
+        // struct copy, no allocation). ~1M calls on fib(28) (perf round 5).
+        if (i < argc && args) {
+            Value a = args[i];
+            slots[i] = (a.type == VAL_INT || a.type == VAL_FLOAT ||
+                        a.type == VAL_BOOL || a.type == VAL_NULL ||
+                        a.type == VAL_FUNCTION)
+                           ? a
+                           : value_clone_impl(a);
+        } else {
+            slots[i] = make_null();
+        }
     }
 
 #define BC_PUSH(v) do { \
@@ -3188,13 +3204,42 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 NativeFn native = NULL;
                 Environment* binding = NULL;
                 resolve_callee_cached(call_node, cname, true, &native, &binding);
-                Value snapshot = binding ? binding->value : make_null();
-                Value cresult = invoke_callee(native, snapshot, cargc, cargs);
-                // eval_call frees args after invoke; BC_CALL historically
-                // did not (leaked every heap arg — invisible on the int-only
-                // benchmarks). Mirror the tree-walker (round 7).
-                for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
-                BC_PUSH(cresult);
+                if (native) {
+                    Value cresult = native(global_interpreter, cargc, cargs);
+                    for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
+                    BC_PUSH(cresult);
+                    break;
+                }
+                // User function: dispatch vm_run directly (perf round 5),
+                // skipping the invoke_callee → interpreter_execute_callback →
+                // bc_try_execute trampoline (~1M traversals on fib(28)).
+                // Semantics preserved exactly:
+                //   snapshot = binding ? binding->value : make_null()  (eval
+                //   order: args evaluated BEFORE callee lookup is consumed)
+                //   invoke_callee(native=NULL, snapshot, ...) with snapshot
+                //   not VAL_FUNCTION → make_null(). That case needs no frame.
+                if (binding && binding->value.type == VAL_FUNCTION) {
+                    BcFunc* callee_bc = bc_func_for(binding->value.func_node);
+                    if (callee_bc) {
+                        Value cresult = vm_run(callee_bc, cargc, cargs);
+                        for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
+                        BC_PUSH(cresult);
+                        break;
+                    }
+                    // Not compilable / RADS_NO_BC: fall through to the
+                    // tree-walker below with snapshot semantics.
+                    Value snapshot = binding->value;
+                    Value cresult = invoke_callee(NULL, snapshot, cargc, cargs);
+                    for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
+                    BC_PUSH(cresult);
+                    break;
+                }
+                {
+                    Value snapshot = binding ? binding->value : make_null();
+                    Value cresult = invoke_callee(NULL, snapshot, cargc, cargs);
+                    for (int i = 0; i < cargc; i++) value_free(&cargs[i]);
+                    BC_PUSH(cresult);
+                }
                 break;
             }
             case BC_POP: {
@@ -3495,14 +3540,17 @@ bad_opcode:
 
 static int bc_disabled = -1; // -1 = not probed, 0 = on, 1 = RADS_NO_BC
 
-// Bytecode fast path for interpreter_execute_callback. Returns true and sets
-// *result if handled; false means fall through to the tree-walker.
-static bool bc_try_execute(ASTNode* func, int argc, Value* args, Value* result) {
+// Returns the compiled BcFunc for a function AST, lazily compiling on first
+// call (perf round 5: extracted from bc_try_execute so BC_CALL can reach
+// vm_run without the invoke_callee → interpreter_execute_callback →
+// bc_try_execute trampoline — ~1M traversals on fib(28)). NULL means the
+// tree-walker must handle this body (RADS_NO_BC set, or outside the subset).
+static BcFunc* bc_func_for(ASTNode* func) {
     if (bc_disabled < 0) {
         const char* env = getenv("RADS_NO_BC");
         bc_disabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
     }
-    if (bc_disabled) return false;
+    if (bc_disabled) return NULL;
 
     void* cache = func->function_decl.bc_cache;
     if (!cache) {
@@ -3514,9 +3562,15 @@ static bool bc_try_execute(ASTNode* func, int argc, Value* args, Value* result) 
         }
         func->function_decl.bc_cache = cache;
     }
-    if (cache == (void*)1) return false;
+    return (cache == (void*)1) ? NULL : (BcFunc*)cache;
+}
 
-    *result = vm_run((BcFunc*)cache, argc, args);
+// Bytecode fast path for interpreter_execute_callback. Returns true and sets
+// *result if handled; false means fall through to the tree-walker.
+static bool bc_try_execute(ASTNode* func, int argc, Value* args, Value* result) {
+    BcFunc* bf = bc_func_for(func);
+    if (!bf) return false;
+    *result = vm_run(bf, argc, args);
     return true;
 }
 
