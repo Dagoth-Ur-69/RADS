@@ -469,7 +469,14 @@ int run_repl() {
         ASTNode* stmt = parse_repl_line(&parser);
 
         if (stmt == NULL || parser.had_error) {
-            // Error already printed by parser
+            // Error already printed by parser. A failed parse can still
+            // return a NON-NULL partial tree: parse_factor builds
+            // binary_op(NULL, rhs) after parse_primary errored (e.g. input
+            // "/exit;"), and other panic-mode paths return half-built
+            // nodes. Nothing borrowed it yet (interpret_repl_statement
+            // never ran), so free the whole tree — this was the 133 B/3
+            // per-line REPL leak (run 30).
+            if (stmt) ast_free(stmt);
             free(source);
             line_num++;
             continue;
