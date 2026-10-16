@@ -44,6 +44,7 @@ test_files=(
     "test_regex.rads"            # run 26: regex.replace overflow + zero-width parity, search uninit crash
     "test_v0.0.12.rads"
     "test_http.rads"
+    "test_enum.rads"            # run 33: bare member resolution + explicit values
 )
 
 for test_file in "${test_files[@]}"; do

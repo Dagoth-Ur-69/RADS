@@ -170,13 +170,14 @@ ASTNode* ast_create_struct_decl(const char* name, ASTList* fields, int line, int
     return node;
 }
 
-ASTNode* ast_create_enum_decl(const char* name, ASTList* values, int line, int column) {
+ASTNode* ast_create_enum_decl(const char* name, ASTList* values, long long* int_values, int line, int column) {
     ASTNode* node = malloc(sizeof(ASTNode));
     node->type = AST_ENUM_DECL;
     node->line = line;
     node->column = column;
     node->enum_decl.name = strdup(name);
     node->enum_decl.values = values;
+    node->enum_decl.int_values = int_values;
     return node;
 }
 
@@ -607,6 +608,7 @@ void ast_free(ASTNode* node) {
         case AST_ENUM_DECL:
             free(node->enum_decl.name);
             ast_list_free(node->enum_decl.values);
+            free(node->enum_decl.int_values); // Run 33: explicit-value array
             break;
         case AST_MEMBER_EXPR:
             ast_free(node->member_expr.object);

@@ -728,7 +728,12 @@ static ASTNode* parse_range(Parser* parser) {
 // Assignment (right-associative): target = value
 static ASTNode* parse_assignment(Parser* parser) {
     ASTNode* expr = parse_range(parser);
-    
+
+    // Run 33: parse_range can return NULL in panic mode (e.g. leftover '='
+    // after a failed enum body). The old code dereferenced expr->type right
+    // here and segfaulted (rc=139) after printing the parse error.
+    if (!expr) return NULL;
+
     if (match(parser, TOKEN_EQUAL)) {
         Token equals = parser->previous;
         ASTNode* value = parse_assignment(parser);
@@ -1233,9 +1238,16 @@ static ASTNode* parse_enum_declaration(Parser* parser) {
     consume(parser, TOKEN_LEFT_BRACE, "Expected '{' before enum body");
 
     ASTList* values = ast_list_create();
+    size_t value_count = 0;
+    long long auto_next = 0;      // auto-counter for bare members
+    bool has_explicit = false;    // any `= value` in this body?
+    // Grown on first explicit value only; NULL = pure auto-numbering.
+    long long* int_values = NULL;
+    size_t int_cap = 0;
     while (!check(parser, TOKEN_RIGHT_BRACE) && !check(parser, TOKEN_EOF)) {
         // Parse enum value name
         consume(parser, TOKEN_IDENTIFIER, "Expected enum value name");
+        if (parser->previous.type != TOKEN_IDENTIFIER) break; // error path: bail out
         char* value_name = malloc(parser->previous.length + 1);
         memcpy(value_name, parser->previous.start, parser->previous.length);
         value_name[parser->previous.length] = '\0';
@@ -1243,6 +1255,85 @@ static ASTNode* parse_enum_declaration(Parser* parser) {
         ASTNode* value = ast_create_identifier(value_name, parser->previous.line, parser->previous.column);
         ast_list_append(values, value);
         free(value_name);
+
+        // Run 33: optional explicit value — `RED = 1` / `BLUE = RED + 3` /
+        // `COLD = -1`. Constant-fold: identifier refs resolve against members
+        // already defined in THIS enum; otherwise fall back to parse_integer
+        // so `RED + 3` still errors cleanly instead of segfaulting.
+        long long eff = auto_next;
+        if (match(parser, TOKEN_EQUAL)) {
+            has_explicit = true;
+            bool neg = match(parser, TOKEN_MINUS);
+            if (match(parser, TOKEN_INTEGER)) {
+                char* end;
+                long long iv = strtoll(parser->previous.start, &end, 10);
+                eff = neg ? -iv : iv;
+            } else if (match(parser, TOKEN_IDENTIFIER)) {
+                // Reference to an earlier member of the same enum.
+                char* ref = malloc(parser->previous.length + 1);
+                memcpy(ref, parser->previous.start, parser->previous.length);
+                ref[parser->previous.length] = '\0';
+                long long ref_val = 0;
+                bool found = false;
+                for (size_t i = 0; i < value_count; i++) {
+                    if (strcmp(values->nodes[i]->identifier.name, ref) == 0) {
+                        ref_val = int_values ? int_values[i] : (long long)i;
+                        found = true;
+                        break;
+                    }
+                }
+                free(ref);
+                if (!found) {
+                    error_at(parser, &parser->previous, "Unknown enum member in explicit value");
+                    break;
+                }
+                // optional "+ N" / "- N" offset
+                if (match(parser, TOKEN_PLUS)) {
+                    if (match(parser, TOKEN_INTEGER)) {
+                        char* end;
+                        long long off = strtoll(parser->previous.start, &end, 10);
+                        ref_val += off;
+                    }
+                } else if (match(parser, TOKEN_MINUS)) {
+                    if (match(parser, TOKEN_INTEGER)) {
+                        char* end;
+                        long long off = strtoll(parser->previous.start, &end, 10);
+                        ref_val -= off;
+                    }
+                }
+                eff = ref_val;
+            } else {
+                error_at(parser, &parser->previous, "Expected integer or member name after '=' in enum");
+                break;
+            }
+        }
+        if (has_explicit || int_values) {
+            if (!int_values) {
+                // First explicit value: materialize the parallel array,
+                // backfilling auto values for any earlier bare members.
+                int_cap = value_count + 8;
+                int_values = calloc(int_cap, sizeof(long long));
+                if (!int_values) { error_at_current(parser, "Out of memory"); break; }
+                for (size_t i = 0; i < value_count; i++) {
+                    int_values[i] = (long long)i; // bare prefix: index numbering
+                }
+            }
+            if (value_count >= int_cap) {
+                int_cap *= 2;
+                long long* grown = realloc(int_values, int_cap * sizeof(long long));
+                if (!grown) {
+                    free(int_values);
+                    int_values = NULL; // avoid dangling store into the node
+                    error_at_current(parser, "Out of memory");
+                    break;
+                }
+                int_values = grown;
+            }
+            int_values[value_count] = eff;
+        }
+
+        value_count++;
+        auto_next = eff + 1; // next bare member continues from here
 
         // Allow optional comma between values
         if (!check(parser, TOKEN_RIGHT_BRACE)) {
@@ -1265,7 +1356,7 @@ static ASTNode* parse_enum_declaration(Parser* parser) {
         // consumed
     }
 
-    ASTNode* enum_decl = ast_create_enum_decl(name, values, line, column);
+    ASTNode* enum_decl = ast_create_enum_decl(name, values, int_values, line, column);
     free(name);
     return enum_decl;
 }

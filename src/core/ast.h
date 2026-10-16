@@ -189,6 +189,10 @@ struct ASTNode {
         struct {
             char* name;
             ASTList* values;  // List of identifier nodes
+            // Run 33: effective member values, parallel to `values`
+            // (explicit `RED = 1` resets the auto counter; NULL = legacy
+            // auto-numbering 0,1,2…, member index IS the value).
+            long long* int_values;
         } enum_decl;
 
         // Return statement
@@ -365,7 +369,7 @@ ASTNode* ast_create_typeof(ASTNode* operand, int line, int column);
 ASTNode* ast_create_function_decl(const char* name, ASTList* params, TypeInfo* return_type, ASTNode* body, bool is_async, int line, int column);
 ASTNode* ast_create_variable_decl(const char* name, TypeInfo* type, ASTNode* initializer, bool is_turbo, int line, int column);
 ASTNode* ast_create_struct_decl(const char* name, ASTList* fields, int line, int column);
-ASTNode* ast_create_enum_decl(const char* name, ASTList* values, int line, int column);
+ASTNode* ast_create_enum_decl(const char* name, ASTList* values, long long* int_values, int line, int column);
 ASTNode* ast_create_return(ASTNode* value, int line, int column);
 ASTNode* ast_create_if(ASTNode* condition, ASTNode* then_branch, ASTNode* else_branch, int line, int column);
 ASTNode* ast_create_loop(ASTNode* condition, ASTNode* body, int line, int column);

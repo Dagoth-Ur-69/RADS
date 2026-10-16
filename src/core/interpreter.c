@@ -786,6 +786,22 @@ static void register_enum(const char* name, ASTNode* node) {
     binding->node = node;
     binding->next = enum_definitions;
     enum_definitions = binding;
+
+    // Run 33: bind every member into the global environment so bare `GREEN`
+    // resolves like any identifier — in the tree-walker, the BC compiler
+    // (BC_GETG), and the REPL. Before this, members were only reachable via
+    // `Color.GREEN` member access, and `turbo i32 c = GREEN;` echoed null.
+    // env_set creates the binding if absent, so re-registration (REPL rerun)
+    // just overwrites in place. Members are plain ints — no refcount games.
+    if (node->enum_decl.values) {
+        for (size_t i = 0; i < node->enum_decl.values->count; i++) {
+            ASTNode* member = node->enum_decl.values->nodes[i];
+            long long v = node->enum_decl.int_values
+                              ? node->enum_decl.int_values[i]
+                              : (long long)i;
+            env_set(member->identifier.name, make_int(v));
+        }
+    }
 }
 
 static ASTNode* find_enum(const char* name) {
@@ -1540,7 +1556,11 @@ static Value eval_expression(ASTNode* node) {
                     for (size_t i = 0; i < enum_node->enum_decl.values->count; i++) {
                         ASTNode* val = enum_node->enum_decl.values->nodes[i];
                         if (strcmp(val->identifier.name, value_name) == 0) {
-                            return make_int((long long)i);
+                            // Run 33: honor explicit `= value` members;
+                            // NULL = legacy auto-numbering (index IS value).
+                            return make_int(enum_node->enum_decl.int_values
+                                                ? enum_node->enum_decl.int_values[i]
+                                                : (long long)i);
                         }
                     }
                     fprintf(stderr, "Error: Enum '%s' has no value '%s'.\n", enum_name, value_name);
