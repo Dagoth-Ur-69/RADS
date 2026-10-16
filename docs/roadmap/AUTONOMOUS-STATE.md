@@ -1,8 +1,57 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-16 (cron run 36)
+Last updated: 2026-10-16 (cron run 37)
 Branch: `phase0/build-recovery`
-HEAD: fc3235b — perf(bc): direct int/float dispatch for non-ADD binops in BC_BIN
+HEAD: 18ae3d9 — perf(bc): dispatch vm_run directly from BC_CALL
+
+## Run 37 — 2026-10-16: BC_CALL direct dispatch (fib round 3, ONE lever)
+
+**What changed:** fresh gprof (new -pg build, fib(28)) replaced the stale
+run-36 profile. Exact counts: `interpreter_execute_callback` 1,028,458,
+`env_intern_entry` 1,028,473, `value_clone_impl` 1,028,458,
+`value_release` 2,056,920. The user-function call path walked a 4-deep
+trampoline (BC_CALL → invoke_callee → interpreter_execute_callback →
+bc_try_execute → vm_run) once per call. The run-36 `bc_put16 ≈ 1.03M`
+anomaly is RESOLVED: it does not appear in the fresh profile — compile
+runs once per function; no per-call recompilation exists.
+
+Patch (lever b + the arg-clone half of the journal's list), in
+`src/core/interpreter.c`:
+- `bc_func_for()` — lazy-compile helper extracted from bc_try_execute
+  (forward-declared after BcFunc so vm_run can call it).
+- BC_CALL: natives keep their exact path (native() inline). User
+  functions dispatch `vm_run` directly when `binding->value.type ==
+  VAL_FUNCTION` and the body compiles; non-compilable / RADS_NO_BC fall
+  back to invoke_callee with snapshot semantics preserved.
+- vm_run param binding: fast path for trivially copyable types
+  (INT/FLOAT/BOOL/NULL/FUNCTION) — exact mirror of the BC_GETL rule and
+  value_clone_impl's behavior for those types (plain struct copy).
+
+**Test results:** 27/27 green (full suite — NOTE: the scratch copy's
+run_tests.sh silently skips missing .rads files; only the repo run
+counts). A/B interleaved (5 rounds × 3 samples, identical flags):
+71.4 → 63.8 ms median, ~10.8%, non-overlapping distributions.
+Benchmark (stable-load run 20261016T182438Z): fib 63.3 vs CPython 62.3
+— **1.016x, statistical parity** (was 1.13x); array_churn 11.1,
+file_io 22.3 (still wins), string_build 26.7 flat. Committed 18ae3d9
+(first commit 789593f had a corrupted word in the message; amended
+before push — local only, no history rewrite reached the remote).
+Pushed to fork. Working tree clean.
+
+**Next up (run 38):** two candidates, pick ONE: (a) beat CPython on fib
+outright — remaining per-call costs are `env_intern_entry` (1.03M, arg
+name interning at binding time) and `resolve_callee_cached` walk on
+every call; consider caching the resolved BcFunc* in the call-site node
+after first successful dispatch (invalidated by cache_gen, like
+resolve_callee_cached's cache), or (b) string_build round 1 — now the
+widest honest gap (26.7 vs 22.7); profile the concat path
+(value_to_string_impl + strdup per concat). Both are measured paths.
+
+**Blockers:** none. Scratch A/B binaries in
+~/.hermes/cache/scratch/rads-r37p (rads-pre / bin/rads). Load average
+spiked to 5.67 mid-run (co-tenant); the recorded benchmark is the
+stable-load pass (load 0.67), not the spike pass.
+
 
 ## Run 36 — 2026-10-16: BC numeric fast-path (fib round 2, ONE lever)
 
