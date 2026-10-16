@@ -1,63 +1,70 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-16 (cron run 32)
+Last updated: 2026-10-16 (cron run 33)
 Branch: `phase0/build-recovery`
-HEAD: 032a3af — build: fix parallel-make self-destruction in sanitize/debug/release
+HEAD: a7c8955 — fix(core): enum member resolution, explicit values, error-path segfault
 
 ## What this run changed
 
-**Run 32 = journal "Next up": `make sanitize -j` build-tree
-self-destruction.** Dead.
+**Run 33 = journal "Next up": enum member resolution.** Three corpses
+in the enum family died together (they shared one root: enums were
+index-only decorations, never values).
 
-1. Repro (scratch `rads-r32b` + 5 fresh `git archive HEAD` trees, warm
-   build dirs): **4/5 failures** — `Fatal error: can't create
-   build/core/x.o: No such file or directory` as `clean`'s tree wipe
-   lands mid-compile. The 5th (cold tree) is why it ever looked
-   intermittent: no objects in flight, no race window.
-2. Fix: `debug:`/`sanitize:`/`release:` no longer list `clean` +
-   `$(TARGET)` as sibling prerequisites. Each is now two sequential
-   recursive sub-makes (`$(MAKE) clean` then `$(MAKE) $(TARGET)
-   CFLAGS=... LDFLAGS=...`). Recipe lines serialize; the jobserver
-   hands `-j` to the inner build (parallelism kept); per-mode flags
-   travel on the sub-make command line so they beat Makefile
-   assignments and reach objects AND the link.
-3. Fidelity verified, not assumed: sanitize compiles carry
-   `-fsanitize=address,undefined,leak`, link `-fsanitize=address,
-   undefined`, **37 `__asan` symbols** in bin/rads; `release` is
-   `-O3 -DNDEBUG` with **zero** `__asan`; `debug` carries
-   `-fsanitize=address,undefined`.
-4. Post-fix: warm-tree `make sanitize -j8` ×3 in scratch + ×2 in the
-   worktree — **all RC=0**. Commit `032a3af`, pushed to fork.
+1. **Bare members never resolved** — `turbo i32 c = GREEN;` echoed
+   `null` in script AND REPL: AST_IDENTIFIER evaluates straight to
+   env_get, and members existed only inside the enum registry,
+   reachable via `Color.GREEN` member access. Fix: `register_enum()`
+   now binds every member into the global env as a plain int. One
+   choke point covers script Pass-1, imports, and REPL re-registration
+   (overwrite-in-place verified); the BC compiler resolves them via
+   BC_GETG like any global — blast body returning GREEN works.
+2. **Explicit `= value` members didn't parse** — `enum L { LOW = 10 }`
+   died with `Expected ',' or '}' in enum`. The enum body loop now
+   accepts `[= [-]int | member [(+|-)int]]` with same-enum constant
+   folding (`HIGH = LOW + 100`); explicit values reset the auto
+   counter, C-style. Effective values live in a parallel
+   `long long*` on the enum node (NULL = legacy index numbering),
+   honored by bare-name AND `Color.RED` member resolution.
+3. **Error path segfaulted (rc=139)** — after ANY enum parse error,
+   leftover tokens reached `parse_assignment`, which dereferenced
+   `expr->type` on a NULL from `parse_range` in panic mode. NULL
+   guard added; p8/p9/p10 probes (bad ref, missing value, bad name)
+   now exit cleanly rc=1 under ASan+UBSan+LSan.
 
-## Test results (run 32)
+Plus one self-inflicted near-miss fixed in-run: the OOM `realloc`
+fail-path in the new value array left a dangling `int_values` pointer
+(freed but not nulled → double-free on ast_free). Nulled.
 
-Scratch: 3/3 `make sanitize -j8` green (was 1/5), debug + release
-green with correct flags. Worktree: `make clean && make -j8` RC=0,
-gauntlet **27/27 green** (`run_tests.sh`, 27 PASSED, 0 FAILED). NOTE:
-one suite run had `test_http.rads` fail on a live `httpbin.org`
-hiccup — immediate rerun passed; flaky network dependency, unrelated
-to this change (patch touches only debug/sanitize/release recipes,
-not the default build path). Pushed: `3a17ed4..032a3af`.
+## Test results (run 33)
+
+Worktree `make clean && make -j8`: RC=0. Gauntlet: **27/27 green**
+(test_enum.rads new — bare resolution, explicit+auto mix, negatives,
+member access, BC path; wired into run_tests.sh). p7 matrix (3 enums ×
+bare/member/BC paths) all correct values; REPL re-registration
+overwrites (`0` then `9`). Error probes p8/p9/p10: clean rc=1, zero
+ASan/UBSan/LSan reports on the debug build. Commit `a7c8955`, pushed
+to fork (`ddc2bbb..a7c8955`).
 
 ## Known hazards (noted, not fixed — pre-existing)
 
-- `turbo i32 c = GREEN;` echoes null — enum member resolution
-  semantics, identical in script mode; not a REPL regression.
 - Native-return values leak engine-wide (run 25 baseline class;
   includes `str.split` tokens) — documented, tolerated.
 - Plain `make` binaries are not ASan-instrumented; any leak claim
-  made without a `make sanitize` build is void (run 31 law). The
-  serial `-j1` rider is REPEALED — parallel sanitize builds are now
-  safe (this run).
+  made without a `make sanitize`/`debug` build is void (run 31 law).
 - `test_http.rads` depends on live httpbin.org — flakes offline;
   rerun before believing a red.
+- `bin/rads --help` advertises `-i, --interactive` but main.c only
+  accepts file paths (REPL reached by running with no args). Cosmetic
+  flag-wiring corpse, backlog.
 
 ## Next up (single task for next run)
 
-1. **Enum member resolution**: `turbo i32 c = GREEN;` echoes `null`
-   in both REPL and script mode. Scratch-repro, find where enum
-   members fail to resolve as values (likely env lookup misses the
-   enum binding table), fix, add a regression test, gauntlet green.
+1. **REPL `-i`/`--interactive` flag wiring** (tiny): main.c arg loop
+   accepts the advertised flags and drops into the REPL instead of
+   `Error: Could not open file '-i'`. Or, if preferred, fix the help
+   text instead. Scratch-repro (done this run: the error above),
+   fix, add REPL regression line to run_tests.sh if the harness
+   supports flag invocations, gauntlet green.
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASan clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
