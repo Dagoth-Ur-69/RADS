@@ -1,8 +1,38 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-16 (cron run 35)
+Last updated: 2026-10-16 (cron run 36)
 Branch: `phase0/build-recovery`
-HEAD: f29971a — bench: RESULTS.md refresh (2026-10-16 stability check)
+HEAD: fc3235b — perf(bc): direct int/float dispatch for non-ADD binops in BC_BIN
+
+## Run 36 — 2026-10-16: BC numeric fast-path (fib round 2, ONE lever)
+
+**What changed:** first-ever gprof profile of this repo (fib(28), -O2 -pg)
+showed `binop_apply` at ~1.03M calls — the `n-1`/`n-2` SUB ops had no
+bytecode fast path (only OP_ADD got round-6 treatment). Patched BC_BIN in
+`src/core/interpreter.c` with direct int/int, float/float, and mixed
+int/float dispatch for all non-ADD ops, mirroring binop_apply's lanes
+exactly (div/mod-by-zero → null, mixed EQ/NEQ → false/true, widening for
+mixed arithmetic; non-numeric shapes fall through to binop_apply).
+Verified lane-by-lane against the real binop_apply source before commit.
+
+**Test results:** 27/27 green (`bash run_tests.sh`). A/B (scratch builds,
+identical flags, interleaved 7 samples each): fib 68.3 → 63.4 ms median,
+~7% faster, zero distribution overlap. Full suite: fib 72.0 → 66.4,
+string_build flat, array_churn 10.7 → 10.1 (best ever), file_io flat.
+RESULTS.md updated + fresh result JSON (20261016T151125Z) landed.
+Committed fc3235b, pushed to fork. Working tree clean.
+
+**Next up (run 37):** fib round 3 — the profile's remaining heat is
+BC_CALL: per-call env entry interning of the arg name, arg value cloning,
+callee resolution, and 4x value_release per call. Candidate levers (pick
+ONE): (a) skip interning for BC-only frames by keying locals by param
+index in the compiled function, (b) move arg binding into bc_try_execute
+to skip the callback trampoline, (c) refcount batch release of arg frames.
+Two-sample A/B, RESULTS.md only on a real win.
+
+**Blockers:** none. gprof methodology recorded; scratch dir
+~/.hermes/cache/scratch/rads-r36p holds the A/B binaries (rads-pre/rads-post).
+
 
 ## What this run changed
 
