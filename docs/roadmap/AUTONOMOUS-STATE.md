@@ -1,8 +1,50 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-16 (cron run 37)
+Last updated: 2026-10-16 (cron run 38)
 Branch: `phase0/build-recovery`
-HEAD: 18ae3d9 — perf(bc): dispatch vm_run directly from BC_CALL
+HEAD: a40a35c — perf(core): cache interned EnvNameEntry* per call-site
+
+## Run 38 — 2026-10-16: per-call-site EnvNameEntry* cache (fib round 4, ONE lever)
+
+**What changed:** the last measured hot-path cost on the call path was the
+per-call re-interning of the callee name — ~1.03M `env_intern_entry`
+(hash + strcmp + bucket walk) hits on fib(28) — just to re-obtain an entry
+that is stable for the process lifetime (verified in run 38 prep: no free
+of EnvNameEntry exists anywhere; entries are never moved). Call nodes now
+cache the `EnvNameEntry*` itself (`cache_nentry` field added to the call
+node in `src/core/ast.h`, NULL-initialized in `src/core/ast.c`, used in
+`resolve_callee_cached` in `src/core/interpreter.c`). Hit path = deref +
+two integer compares; zero string work. `gen`/`frameable` invalidation
+still reads the LIVE entry, so invalidation semantics are byte-identical
+to re-interning. `find_native` per-call walk remains (not touched).
+
+**Method honored:** pre-patch binary captured FIRST (`rads-pre`, 18:04),
+then patched, rebuilt, A/B'd. `make` clean (no warnings), sanity gate
+(exact `fib(28) = 317811` output) passed every sample.
+
+**A/B (interleaved, 5 rounds × 4 samples, co-tenant load ~4.6–5.3 on 8
+cores):** pre 98–99 ms vs post 82–83 ms — ~16% on the raw binary,
+non-overlapping distributions.
+
+**Benchmark harness (best-of-3, results/20261016T210919Z.json):**
+fib **55.6 vs CPython 61.6 (1.108x — OUTRIGHT WIN**, the parity from run
+37 is broken in RADS's favor); string_build 26.4 vs 23.1 (CPython still
+leads); array_churn **10.7 vs 15.2** (RADS wins); file_io **22.6 vs 38.7**
+(RADS wins). RADS now beats CPython 3 of 4, Node 4 of 4.
+
+**Test results:** 27/27 green in the repo tree (`bash run_tests.sh`).
+
+**Commits:** `a40a35c` (perf + RESULTS.md + result JSON). Pushed to fork
+`phase0/build-recovery`. Tree clean after journal commit.
+
+**Next up (run 39) — pick ONE:**
+- (a) string_build round 1: 26.4 vs 23.1 — now the only benchmark where
+  CPython leads. Profile the concat path (value_clone of string payloads,
+  buffer growth); likely lever: in-place growable buffer or rope-style
+  append instead of clone-per-concat.
+- (b) fib round 5: cache `find_native` result alongside the entry (one
+  more integer compare on the hit path) — small but measured.
+Recommend (a): a losing benchmark matters more than widening a win.
 
 ## Run 37 — 2026-10-16: BC_CALL direct dispatch (fib round 3, ONE lever)
 
