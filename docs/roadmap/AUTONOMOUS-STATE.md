@@ -1,42 +1,34 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-16 (cron run 34)
+Last updated: 2026-10-16 (cron run 35)
 Branch: `phase0/build-recovery`
-HEAD: ea8eaf7 — test(cli): lock -i shared-globals REPL + -t guard into the gauntlet
+HEAD: f29971a — bench: RESULTS.md refresh (2026-10-16 stability check)
 
 ## What this run changed
 
-**Run 34 = journal "Next up": `-i`/`--interactive` flag wiring.** The
-advertised flags were filenames (`Error: Could not open file '-i'`).
-Now python-`-i` semantics: run FILE, then drop into a REPL that shares
-the program's globals.
+**Run 35 = journal "Next up": benchmark refresh (workstream #1).**
+RESULTS.md was frozen at 2026-10-11, pre-dating enum values + flag work.
 
-1. `interpret()` factored: `interpret_program()` (passes 0–2, no
-   teardown) + `interpret()` (script mode, run-28 teardown) +
-   `interpret_keep()` (run 34: no env/registry/event-loop teardown —
-   the handoff would die with it).
-2. `run_repl(ASTNode* preload_ast)`: adopts the program AST into the
-   run-27 retention arena — Pass-1 registrations in the live env borrow
-   `func_node` from it (the run-27 UAF class); freed last at shutdown,
-   after `interpreter_cleanup_environment()` + event-loop cleanup.
-   Teardown order preserved: env → registries → parked imports → event
-   loop → AST roots. Plain-REPL callers pass NULL.
-3. `stdlib_register_all()` idempotent (the `-i` path enters it twice).
-4. `-t` without a file: dedicated "requires an input file" error
-   (was the generic "No input file" misdirection). `-i` without a
-   file: plain REPL. Usage text describes real `-i` semantics.
-5. Gauntlet gate added: probe file + stdin through `rads -i FILE`,
-   asserts global/blast/struct/enum reachability + session notice +
-   `-t` guard exit code.
+1. Two fresh full samples (`20261016T120234Z.json`, `20261016T120329Z.json`)
+   vs the 10-13 baselines: fib 71.0 → 72.0/76.5 ms; string_build,
+   array_churn, file_io flat. **No regression from the enum/flag/`-i`
+   work — no bisect needed.** 12 days of engine work cost zero throughput.
+2. Landed 15 orphaned result JSONs (12 from 10-12/10-13 + the 2 fresh);
+   `benchmarks/results/` fully tracked now (27 files).
+3. Quarantined two stray `rads-asan` artifacts (broken root symlink + ELF
+   under tools/rads-mask/ — run-31-era ad-hoc sanitizer builds, no Makefile
+   target) to `~/.hermes/cache/scratch/rads-r35-artifacts/`; `.gitignore`
+   now covers `rads-asan`/`rads-ubsan`/`rads-sanitize`.
+4. RESULTS.md: new latest-run table + honest takeaways. Corrected the
+   stale "3 of 4 vs CPython" claim to **2 of 4** — fib (1.20x) and
+   string_build (1.22x) are losses; array_churn + file_io win; Node
+   swept 4 of 4. Changelog entries for the 10-13 baselines and today.
 
-## Test results (run 34)
+## Test results (run 35)
 
-`make clean && make -j8`: RC=0. Gauntlet: **27/27 green** including
-the new `-i` gate. Manual probes: `secret`=42, `double(21)`=42,
-`p.tag`=t, `Color.GREEN`=20, in-REPL fn redefinition takes effect.
-ASan+UBSan+LSan clean on the full `-i` lifecycle (sanitize build).
-Exit codes: `-i`+EOF rc=0, `-t` no-file rc=1. Commits `8ae5317` +
-`ea8eaf7`, pushed to fork.
+Build: `make -j8` RC=0. Gauntlet: **27/27 green** (re-verified before
+push; this run touched docs/data only, no source). Commits `cd59adc` +
+`b295598` + `f29971a` pushed to fork.
 
 ## Known hazards (noted, not fixed — pre-existing)
 
@@ -51,16 +43,34 @@ Exit codes: `-i`+EOF rc=0, `-t` no-file rc=1. Commits `8ae5317` +
 
 ## Next up (single task for next run)
 
-1. **Benchmark refresh (AGENTS.md workstream #1).**
-   `benchmarks/RESULTS.md` latest = 2026-10-11, pre-dating enum
-   values (a7c8955) and the flag work. Re-run `bash benchmarks/run.sh`
-   on this box, land fresh machine-readable results in
-   `benchmarks/results/`, update RESULTS.md tables + notes, commit.
-   If a workload regresses vs 10-11, bisect before writing prose.
+1. **fib optimization round 2 (workstream #1, the actual numbers).**
+   fib is the flagship workload and RADS loses it to CPython 1.20x
+   (72.0 vs 59.9 ms). The 10-11 wins came from call-frame overhead;
+   next levers: direct call sites for binary int arithmetic in the
+   BC fast path (skip generic dispatch when both operands are int),
+   and `fib`-shaped recursion — argument boxing/unboxing per call.
+   Method: profile (`perf` if present, else manual counters), ONE
+   optimization, two-sample A/B vs `20261016T120234Z.json`/`120329Z`,
+   update RESULTS.md only on a real win. Gauntlet must stay 27/27
+   and BC-vs-tree-walker output must stay byte-identical.
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASan clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
 vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 34 (previous run — summary retained below)
+
+**Run 34 = `-i`/`--interactive` flag wiring.** Advertised flags were
+filenames (`Error: Could not open file '-i'`); now python-`-i`
+semantics (run FILE, then REPL sharing the program's globals).
+`interpret()` factored into `interpret_program()` + `interpret_keep()`
+(no teardown — the handoff would die with it); `run_repl(preload_ast)`
+adopts the program AST into the run-27 retention arena (Pass-1
+registrations borrow `func_node` from it — the run-27 UAF class);
+`stdlib_register_all()` idempotent; `-t` no-file guard + real usage
+text. Gauntlet 27/27 with a new `-i` gate (global/fn/struct/enum
+reachability). ASan+UBSan+LSan clean on the full `-i` lifecycle.
+Commits `8ae5317` + `ea8eaf7` pushed to fork.
 
 ## Run 33 (previous run — summary retained below)
 
