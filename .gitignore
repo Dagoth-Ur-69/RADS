@@ -20,6 +20,11 @@ rads-convert
 rads-repl
 rads-debug
 
+# Sanitizer builds (ad-hoc `make sanitize`-style artifacts)
+rads-asan
+rads-ubsan
+rads-sanitize
+
 # Compiled object files
 *.o
 *.obj
