@@ -72,6 +72,7 @@ typedef struct Interpreter {
 
 // Interpreter functions
 int interpret(ASTNode* program);
+int interpret_keep(ASTNode* program);  // Run 34: -i mode — no teardown; REPL inherits globals
 int interpret_repl_statement(ASTNode* stmt);  // For REPL - executes single statement
 void value_print(Value* value);
 char* value_to_string(Value* value); // malloc'd; caller frees. echo/str() single source of truth

@@ -94,7 +94,10 @@
 #define CURSOR_BAR_BLINK        "\033[5 q"  // Blinking bar (I-beam)
 #define CURSOR_BAR_STEADY       "\033[6 q"  // Steady bar
 
+static bool stdlib_registered = false;
 static void stdlib_register_all(void) {
+    if (stdlib_registered) return; // Run 34: -i path re-enters via run_repl
+    stdlib_registered = true;
     stdlib_io_register();
     stdlib_media_register();
     stdlib_net_register();
@@ -160,7 +163,7 @@ void print_usage() {
     printf("  -h, --help     Show this help message\n");
     printf("  -v, --version  Show version information\n");
     printf("  -t, --tokens   Print tokens (lexer test mode)\n");
-    printf("  -i, --interactive  Enter interactive REPL mode\n");
+    printf("  -i, --interactive  Run FILE (if given), then enter the REPL with its globals\n");
     printf("\nIf no file is provided, RADS will start in interactive REPL mode.\n");
     printf("\n");
 }
@@ -343,7 +346,7 @@ void print_repl_help() {
     printf("\n");
 }
 
-int run_repl() {
+int run_repl(ASTNode* preload_ast) {
     print_repl_welcome();
 
     // Initialize standard library
@@ -362,6 +365,27 @@ int run_repl() {
     ASTNode** repl_ast_arena = NULL;
     size_t repl_ast_count = 0;
     size_t repl_ast_capacity = 0;
+
+    // Run 34: -i file.rads handoff. interpret_keep() ran the file without
+    // tearing down the env, so this REPL shares its globals. The program
+    // AST joins the retention arena: Pass-1 registrations in the live env
+    // borrow func_node from it (the run 27 UAF class) — it must outlive
+    // every borrower, i.e. be freed with the arena at shutdown, last.
+    if (preload_ast) {
+        repl_ast_arena = malloc(sizeof(ASTNode*));
+        if (!repl_ast_arena) {
+            fprintf(stderr, "rads: out of memory entering interactive mode\n");
+            interpreter_cleanup_environment();
+            interpreter_cleanup_event_loop();
+            ast_free(preload_ast);
+            return 1;
+        }
+        repl_ast_arena[0] = preload_ast;
+        repl_ast_count = 1;
+        repl_ast_capacity = 1;
+        printf("%s📚 Interactive session — globals from the executed file are live.%s\n\n",
+               COLOR_BRIGHT_GREEN, COLOR_RESET);
+    }
 
     // RGB Chroma color cycle for prompt (like RGB keyboard)
     const char* chroma_colors[] = {
@@ -525,10 +549,11 @@ int run_repl() {
 int main(int argc, char* argv[]) {
     // If no arguments, start REPL
     if (argc < 2) {
-        return run_repl();
+        return run_repl(NULL);
     }
     
     bool token_mode = false;
+    bool interactive = false;
     const char* filename = NULL;
     
     // Parse arguments
@@ -541,12 +566,25 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tokens") == 0) {
             token_mode = true;
+        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0) {
+            interactive = true;
         } else {
             filename = argv[i];
         }
     }
     
     if (filename == NULL) {
+        if (interactive) {
+            // -i with no file: plain REPL (same as no arguments)
+            return run_repl(NULL);
+        }
+        if (token_mode) {
+            // Run 34: -t used to fall into the generic "No input file"
+            // error, hiding what was actually wrong.
+            fprintf(stderr, "Error: -t/--tokens requires an input file\n");
+            print_usage();
+            return 1;
+        }
         fprintf(stderr, "Error: No input file specified\n");
         print_usage();
         return 1;
@@ -588,6 +626,26 @@ int main(int argc, char* argv[]) {
     }
     
     // Interpret
+    // Run 34: -i/--interactive — python-style: run the file, then drop
+    // into a REPL that shares the program's globals. interpret_keep()
+    // skips the env/registry teardown (run 28's script-mode teardown
+    // would destroy the handoff), and run_repl adopts the program AST
+    // into its retention arena (Pass-1 registrations borrow func_node
+    // from it — run 27 UAF class).
+    if (interactive) {
+        int result = interpret_keep(program);
+        if (stdlib_test_failed()) result = 1;
+        free(source);
+        if (result != 0) {
+            // Mirror the REPL exit order: borrowers down first, AST last.
+            interpreter_cleanup_environment();
+            interpreter_cleanup_event_loop();
+            ast_free(program);
+            return 1;
+        }
+        return run_repl(program);
+    }
+
     int result = interpret(program);
     // Test-failure latch (run 23): describe/it/run harness failures now
     // propagate to the process exit code.

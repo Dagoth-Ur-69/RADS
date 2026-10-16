@@ -3519,8 +3519,10 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
     return rv;
 }
 
-// Main interpreter
-int interpret(ASTNode* program) {
+// Run 34: execution front half (passes 0-2), factored out of interpret()
+// so the -i/--interactive path can run a file and keep the process alive
+// for a REPL that inherits its globals. Tears nothing down.
+static int interpret_program(ASTNode* program) {
     if (!program || program->type != AST_PROGRAM) {
         fprintf(stderr, "Error: Invalid program\n");
         return 1;
@@ -3581,6 +3583,13 @@ int interpret(ASTNode* program) {
     }
 
 
+    return 0;
+}
+
+// Script mode (run 28 semantics): execute, then tear the world down.
+int interpret(ASTNode* program) {
+    int result = interpret_program(program);
+
     // Run 28: script mode now tears down the registries (it never did —
     // bindings leaked per run as still-reachable globals). Order matters:
     // env first (value_release touches definition), then the registry that
@@ -3590,7 +3599,18 @@ int interpret(ASTNode* program) {
     env_free_enums();
     parked_imports_free(); // Run 30: ASTs outlive all env borrowers; free last
     interpreter_cleanup_event_loop();
-    return 0;
+    return result;
+}
+
+// Run 34: -i/--interactive mode — identical execution, but the
+// environment, function/struct/enum registries, and event loop stay
+// live so the REPL that follows shares the program's globals
+// (python -i semantics). The caller must keep the program AST alive
+// until the REPL exits: Pass-1 registrations borrow func_node from it
+// (run 27). Teardown happens on the REPL exit path
+// (interpreter_cleanup_environment + interpreter_cleanup_event_loop).
+int interpret_keep(ASTNode* program) {
+    return interpret_program(program);
 }
 
 // REPL-specific interpreter - executes single statement without clearing environment
