@@ -111,6 +111,50 @@ else
     ((total_failed++))
 fi
 
+echo "REPL -i/--interactive flag (run 34)"
+# Run 34: `rads -i FILE` must run FILE then share its globals with the REPL
+# (python -i semantics): plain global, blast fn, struct, enum all reachable.
+i_probe="$TMPDIR/rads_i_probe.txt"
+if [ -z "$TMPDIR" ]; then i_probe="/tmp/rads_i_probe.txt"; fi
+cat > "$i_probe.rads" <<'EOF'
+turbo i32 secret = 42;
+blast double(x) { return x * 2; }
+struct Pt { str tag; i32 n; }
+enum Color { RED = 10, GREEN = 20 }
+EOF
+cat > "$i_probe" <<'EOF'
+echo secret;
+echo double(21);
+turbo Pt p = Pt { tag: "t", n: 5 };
+echo p.tag;
+echo Color.GREEN;
+.exit
+EOF
+i_out="$($RADS_BIN -i "$i_probe.rads" < "$i_probe" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+i_ok=1
+for expected in "42" "42" "t" "20"; do
+    if ! echo "$i_out" | grep -qx "$expected"; then
+        echo "✗ -i REPL output missing '$expected'"
+        i_ok=0
+    fi
+done
+if ! echo "$i_out" | grep -q "globals from the executed file are live"; then
+    echo "✗ -i session notice missing"
+    i_ok=0
+fi
+# -t without a file must fail with its dedicated error (run 34)
+if $RADS_BIN -t >/dev/null 2>&1; then
+    echo "✗ -t without file should exit non-zero"
+    i_ok=0
+fi
+if [ $i_ok -eq 1 ]; then
+    echo "✓ -i shared-globals REPL + -t guard PASSED"
+else
+    echo "$i_out" | grep -v "^rads\[" | tail -20
+    ((total_failed++))
+fi
+rm -f "$i_probe" "$i_probe.rads"
+
 echo ""
 echo "======================================"
 echo "Test Summary"
