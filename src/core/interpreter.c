@@ -3049,6 +3049,71 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                         break;
                     }
                 }
+                // Perf round 11: direct numeric dispatch for the non-ADD
+                // ops, skipping the binop_apply call (which the gprof run-36
+                // profile showed at ~1M calls for fib(28)). Every arm mirrors
+                // binop_apply's lane bit-for-bit — including div/mod-by-zero
+                // → null and mixed-type EQ/NEQ folding through the else to
+                // false/true; non-numeric shapes fall to the generic call.
+                // INT/FLOAT payloads are inline (value_free is a no-op), so
+                // skipping binop_apply's trailing frees is observationally
+                // identical.
+                if (left.type == VAL_INT && right.type == VAL_INT) {
+                    long long a = left.int_val, b = right.int_val;
+                    switch ((OperatorType)bop) {
+                        case OP_SUB:  BC_PUSH(make_int(a - b)); break;
+                        case OP_MUL:  BC_PUSH(make_int(a * b)); break;
+                        case OP_DIV:  BC_PUSH(b != 0 ? make_int(a / b) : make_null()); break;
+                        case OP_MOD:  BC_PUSH(b != 0 ? make_int(a % b) : make_null()); break;
+                        case OP_LT:   BC_PUSH(make_bool(a <  b)); break;
+                        case OP_LTE:  BC_PUSH(make_bool(a <= b)); break;
+                        case OP_GT:   BC_PUSH(make_bool(a >  b)); break;
+                        case OP_GTE:  BC_PUSH(make_bool(a >= b)); break;
+                        case OP_EQ:   BC_PUSH(make_bool(a == b)); break;
+                        case OP_NEQ:  BC_PUSH(make_bool(a != b)); break;
+                        default:      BC_PUSH(binop_apply((OperatorType)bop, left, right)); break;
+                    }
+                    break;
+                }
+                if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
+                    double a = left.float_val, b = right.float_val;
+                    switch ((OperatorType)bop) {
+                        case OP_SUB:  BC_PUSH(make_float(a - b)); break;
+                        case OP_MUL:  BC_PUSH(make_float(a * b)); break;
+                        case OP_DIV:  BC_PUSH(b != 0.0 ? make_float(a / b) : make_null()); break;
+                        case OP_MOD:  BC_PUSH(b != 0.0 ? make_float(fmod(a, b)) : make_null()); break;
+                        case OP_LT:   BC_PUSH(make_bool(a <  b)); break;
+                        case OP_LTE:  BC_PUSH(make_bool(a <= b)); break;
+                        case OP_GT:   BC_PUSH(make_bool(a >  b)); break;
+                        case OP_GTE:  BC_PUSH(make_bool(a >= b)); break;
+                        case OP_EQ:   BC_PUSH(make_bool(a == b)); break;
+                        case OP_NEQ:  BC_PUSH(make_bool(a != b)); break;
+                        default:      BC_PUSH(binop_apply((OperatorType)bop, left, right)); break;
+                    }
+                    break;
+                }
+                if ((left.type == VAL_INT || left.type == VAL_FLOAT) &&
+                    (right.type == VAL_INT || right.type == VAL_FLOAT)) {
+                    // Mixed int/float: binop_apply widens to double for the
+                    // arithmetic and ordering lanes; EQ/NEQ have no mixed
+                    // lane and fold through the else to false/true.
+                    double a = left.type == VAL_INT ? (double)left.int_val : left.float_val;
+                    double b = right.type == VAL_INT ? (double)right.int_val : right.float_val;
+                    switch ((OperatorType)bop) {
+                        case OP_SUB:  BC_PUSH(make_float(a - b)); break;
+                        case OP_MUL:  BC_PUSH(make_float(a * b)); break;
+                        case OP_DIV:  BC_PUSH(b != 0.0 ? make_float(a / b) : make_null()); break;
+                        case OP_MOD:  BC_PUSH(b != 0.0 ? make_float(fmod(a, b)) : make_null()); break;
+                        case OP_LT:   BC_PUSH(make_bool(a <  b)); break;
+                        case OP_LTE:  BC_PUSH(make_bool(a <= b)); break;
+                        case OP_GT:   BC_PUSH(make_bool(a >  b)); break;
+                        case OP_GTE:  BC_PUSH(make_bool(a >= b)); break;
+                        case OP_EQ:   BC_PUSH(make_bool(false)); break;
+                        case OP_NEQ:  BC_PUSH(make_bool(true)); break;
+                        default:      BC_PUSH(binop_apply((OperatorType)bop, left, right)); break;
+                    }
+                    break;
+                }
                 BC_PUSH(binop_apply((OperatorType)bop, left, right));
                 break;
             }
