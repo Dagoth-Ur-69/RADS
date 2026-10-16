@@ -1,74 +1,80 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 31)
+Last updated: 2026-10-16 (cron run 32)
 Branch: `phase0/build-recovery`
-HEAD: 2dddeea — fix(memory): free partial statement AST on REPL parse-error path
+HEAD: 032a3af — build: fix parallel-make self-destruction in sanitize/debug/release
 
 ## What this run changed
 
-**Run 31 = journal "Next up": the REPL statement-AST leak.** Dead.
+**Run 32 = journal "Next up": `make sanitize -j` build-tree
+self-destruction.** Dead.
 
-1. Root cause (run 30's 133 B / 3 residue, LSan differential in
-   scratch `rads-r31`): NOT per-clean-line — **error-path only**.
-   `parse_primary` fails on an unexpected token (e.g. `/exit;` →
-   `/`), sets `had_error`, returns NULL; `parse_factor` has no
-   NULL-check, re-consumes `/` as the division operator, parses
-   `exit` as an identifier, returns non-NULL
-   `binary_op(NULL, ident)` (ast.c:107 + ast.c:98/102). `run_repl`
-   (main.c ~471) on `had_error` freed only `source` and dropped the
-   partial tree. Script mode was already safe (parser.c:1558 frees
-   via `ast_list_free`).
-2. Attribution correction: run 30 attributed the 133 B/3 to clean
-   `echo add(1,2);` lines. Run 31 differential on the TRUE pristine
-   source (`git show 778da71:src/core/main.c`, sanitizer-built):
-   clean probe (structs, closures, fib(15), echo) = **0 leaks**;
-   `/exit;` poison = **133 B / 3 exact**. Run 30's probe session
-   must have included the error line (its lsan3.txt did: `/exit;`).
-3. Fix: REPL-side one chokepoint — `if (stmt) ast_free(stmt);` in
-   the `stmt == NULL || parser.had_error` branch of `run_repl`,
-   before `free(source)`. Chosen over parser-side NULL propagation
-   because `ast_free` is NULL-child-safe and nothing had borrowed
-   the tree (`interpret_repl_statement` never ran). 8 lines with
-   comment, applied identically in scratch then worktree.
-4. Instrumentation lesson (why run 31's first probes showed "no
-   leaks" everywhere): plain `make` builds are NOT
-   sanitizer-instrumented — `ASAN_OPTIONS=detect_leaks=1` on a
-   plain binary is a no-op. All leak verdicts REQUIRE
-   `make sanitize -j1` (serial — see hazards).
+1. Repro (scratch `rads-r32b` + 5 fresh `git archive HEAD` trees, warm
+   build dirs): **4/5 failures** — `Fatal error: can't create
+   build/core/x.o: No such file or directory` as `clean`'s tree wipe
+   lands mid-compile. The 5th (cold tree) is why it ever looked
+   intermittent: no objects in flight, no race window.
+2. Fix: `debug:`/`sanitize:`/`release:` no longer list `clean` +
+   `$(TARGET)` as sibling prerequisites. Each is now two sequential
+   recursive sub-makes (`$(MAKE) clean` then `$(MAKE) $(TARGET)
+   CFLAGS=... LDFLAGS=...`). Recipe lines serialize; the jobserver
+   hands `-j` to the inner build (parallelism kept); per-mode flags
+   travel on the sub-make command line so they beat Makefile
+   assignments and reach objects AND the link.
+3. Fidelity verified, not assumed: sanitize compiles carry
+   `-fsanitize=address,undefined,leak`, link `-fsanitize=address,
+   undefined`, **37 `__asan` symbols** in bin/rads; `release` is
+   `-O3 -DNDEBUG` with **zero** `__asan`; `debug` carries
+   `-fsanitize=address,undefined`.
+4. Post-fix: warm-tree `make sanitize -j8` ×3 in scratch + ×2 in the
+   worktree — **all RC=0**. Commit `032a3af`, pushed to fork.
 
-## Test results (run 31)
+## Test results (run 32)
 
-Scratch (`make sanitize -j1` builds, LSan): pristine(778da71) +
-poison **133 B/3** vs fixed + poison **0/0** (twice, incl. after
-negative-control restore); fixed + clean probe 0/0; pristine + clean
-probe 0/0 (attribution correction). Scratch `run_tests.sh` green.
-Worktree: `make clean && make -j$(nproc)` RC=0, gauntlet **26/26**
-green. Pushed to fork: `778da71..2dddeea`.
+Scratch: 3/3 `make sanitize -j8` green (was 1/5), debug + release
+green with correct flags. Worktree: `make clean && make -j8` RC=0,
+gauntlet **27/27 green** (`run_tests.sh`, 27 PASSED, 0 FAILED). NOTE:
+one suite run had `test_http.rads` fail on a live `httpbin.org`
+hiccup — immediate rerun passed; flaky network dependency, unrelated
+to this change (patch touches only debug/sanitize/release recipes,
+not the default build path). Pushed: `3a17ed4..032a3af`.
 
 ## Known hazards (noted, not fixed — pre-existing)
 
-- `make sanitize -j` destroys the build tree (clean + order-only
-  dirs race under -j) — build sanitize serially (`-j1`); Makefile
-  hazard worth a dedicated fix run.
 - `turbo i32 c = GREEN;` echoes null — enum member resolution
   semantics, identical in script mode; not a REPL regression.
 - Native-return values leak engine-wide (run 25 baseline class;
   includes `str.split` tokens) — documented, tolerated.
 - Plain `make` binaries are not ASan-instrumented; any leak claim
-  made without a `make sanitize -j1` build is void (run 31 law).
+  made without a `make sanitize` build is void (run 31 law). The
+  serial `-j1` rider is REPEALED — parallel sanitize builds are now
+  safe (this run).
+- `test_http.rads` depends on live httpbin.org — flakes offline;
+  rerun before believing a red.
 
 ## Next up (single task for next run)
 
-1. **`make sanitize -j` build-tree self-destruction**: clean +
-   order-only dirs race under -j. Fix the Makefile (order-only
-   prerequisites on dirs / REMOVE the parallel-unsafe clean), prove
-   `make sanitize -j$(nproc)` works, then `make clean && make
-   -j$(nproc)` + gauntlet green. Small, high-leverage, kills a
-   standing hazard.
+1. **Enum member resolution**: `turbo i32 c = GREEN;` echoes `null`
+   in both REPL and script mode. Scratch-repro, find where enum
+   members fail to resolve as values (likely env lookup misses the
+   enum binding table), fix, add a regression test, gauntlet green.
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASan clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
 vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 31 (previous run — summary retained below)
+
+**Run 31 = the REPL statement-AST leak.** Dead. Root cause:
+`parse_factor` has no NULL-check after `parse_primary` errors —
+`/exit;` yields non-NULL `binary_op(NULL, ident)` which `run_repl`
+dropped on the `had_error` path. Fix: one chokepoint in main.c —
+`if (stmt) ast_free(stmt);` on the parse-error branch. Attribution
+corrected vs run 30: clean probes = 0 leaks, `/exit;` poison =
+133 B / 3 exact — error-path only. LSan differential 133 B/3 → 0/0
+(twice), gauntlet 26/26, commits `2dddeea`+`3a17ed4` pushed. Law
+enacted: leak verdicts require sanitizer builds (plain `make` is
+uninstrumented).
 
 ## Run 30 (previous run — summary retained below)
 
