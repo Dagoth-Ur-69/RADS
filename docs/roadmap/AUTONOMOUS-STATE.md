@@ -1,49 +1,42 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-16 (cron run 33)
+Last updated: 2026-10-16 (cron run 34)
 Branch: `phase0/build-recovery`
-HEAD: a7c8955 — fix(core): enum member resolution, explicit values, error-path segfault
+HEAD: ea8eaf7 — test(cli): lock -i shared-globals REPL + -t guard into the gauntlet
 
 ## What this run changed
 
-**Run 33 = journal "Next up": enum member resolution.** Three corpses
-in the enum family died together (they shared one root: enums were
-index-only decorations, never values).
+**Run 34 = journal "Next up": `-i`/`--interactive` flag wiring.** The
+advertised flags were filenames (`Error: Could not open file '-i'`).
+Now python-`-i` semantics: run FILE, then drop into a REPL that shares
+the program's globals.
 
-1. **Bare members never resolved** — `turbo i32 c = GREEN;` echoed
-   `null` in script AND REPL: AST_IDENTIFIER evaluates straight to
-   env_get, and members existed only inside the enum registry,
-   reachable via `Color.GREEN` member access. Fix: `register_enum()`
-   now binds every member into the global env as a plain int. One
-   choke point covers script Pass-1, imports, and REPL re-registration
-   (overwrite-in-place verified); the BC compiler resolves them via
-   BC_GETG like any global — blast body returning GREEN works.
-2. **Explicit `= value` members didn't parse** — `enum L { LOW = 10 }`
-   died with `Expected ',' or '}' in enum`. The enum body loop now
-   accepts `[= [-]int | member [(+|-)int]]` with same-enum constant
-   folding (`HIGH = LOW + 100`); explicit values reset the auto
-   counter, C-style. Effective values live in a parallel
-   `long long*` on the enum node (NULL = legacy index numbering),
-   honored by bare-name AND `Color.RED` member resolution.
-3. **Error path segfaulted (rc=139)** — after ANY enum parse error,
-   leftover tokens reached `parse_assignment`, which dereferenced
-   `expr->type` on a NULL from `parse_range` in panic mode. NULL
-   guard added; p8/p9/p10 probes (bad ref, missing value, bad name)
-   now exit cleanly rc=1 under ASan+UBSan+LSan.
+1. `interpret()` factored: `interpret_program()` (passes 0–2, no
+   teardown) + `interpret()` (script mode, run-28 teardown) +
+   `interpret_keep()` (run 34: no env/registry/event-loop teardown —
+   the handoff would die with it).
+2. `run_repl(ASTNode* preload_ast)`: adopts the program AST into the
+   run-27 retention arena — Pass-1 registrations in the live env borrow
+   `func_node` from it (the run-27 UAF class); freed last at shutdown,
+   after `interpreter_cleanup_environment()` + event-loop cleanup.
+   Teardown order preserved: env → registries → parked imports → event
+   loop → AST roots. Plain-REPL callers pass NULL.
+3. `stdlib_register_all()` idempotent (the `-i` path enters it twice).
+4. `-t` without a file: dedicated "requires an input file" error
+   (was the generic "No input file" misdirection). `-i` without a
+   file: plain REPL. Usage text describes real `-i` semantics.
+5. Gauntlet gate added: probe file + stdin through `rads -i FILE`,
+   asserts global/blast/struct/enum reachability + session notice +
+   `-t` guard exit code.
 
-Plus one self-inflicted near-miss fixed in-run: the OOM `realloc`
-fail-path in the new value array left a dangling `int_values` pointer
-(freed but not nulled → double-free on ast_free). Nulled.
+## Test results (run 34)
 
-## Test results (run 33)
-
-Worktree `make clean && make -j8`: RC=0. Gauntlet: **27/27 green**
-(test_enum.rads new — bare resolution, explicit+auto mix, negatives,
-member access, BC path; wired into run_tests.sh). p7 matrix (3 enums ×
-bare/member/BC paths) all correct values; REPL re-registration
-overwrites (`0` then `9`). Error probes p8/p9/p10: clean rc=1, zero
-ASan/UBSan/LSan reports on the debug build. Commit `a7c8955`, pushed
-to fork (`ddc2bbb..a7c8955`).
+`make clean && make -j8`: RC=0. Gauntlet: **27/27 green** including
+the new `-i` gate. Manual probes: `secret`=42, `double(21)`=42,
+`p.tag`=t, `Color.GREEN`=20, in-REPL fn redefinition takes effect.
+ASan+UBSan+LSan clean on the full `-i` lifecycle (sanitize build).
+Exit codes: `-i`+EOF rc=0, `-t` no-file rc=1. Commits `8ae5317` +
+`ea8eaf7`, pushed to fork.
 
 ## Known hazards (noted, not fixed — pre-existing)
 
@@ -53,22 +46,32 @@ to fork (`ddc2bbb..a7c8955`).
   made without a `make sanitize`/`debug` build is void (run 31 law).
 - `test_http.rads` depends on live httpbin.org — flakes offline;
   rerun before believing a red.
-- `bin/rads --help` advertises `-i, --interactive` but main.c only
-  accepts file paths (REPL reached by running with no args). Cosmetic
-  flag-wiring corpse, backlog.
+- Journal gap: run 32's demoted summary was dropped by run 33's
+  rewrite (content recoverable at commit `ddc2bbb`).
 
 ## Next up (single task for next run)
 
-1. **REPL `-i`/`--interactive` flag wiring** (tiny): main.c arg loop
-   accepts the advertised flags and drops into the REPL instead of
-   `Error: Could not open file '-i'`. Or, if preferred, fix the help
-   text instead. Scratch-repro (done this run: the error above),
-   fix, add REPL regression line to run_tests.sh if the harness
-   supports flag invocations, gauntlet green.
+1. **Benchmark refresh (AGENTS.md workstream #1).**
+   `benchmarks/RESULTS.md` latest = 2026-10-11, pre-dating enum
+   values (a7c8955) and the flag work. Re-run `bash benchmarks/run.sh`
+   on this box, land fresh machine-readable results in
+   `benchmarks/results/`, update RESULTS.md tables + notes, commit.
+   If a workload regresses vs 10-11, bisect before writing prose.
 
 Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
 ASan clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
 vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 33 (previous run — summary retained below)
+
+**Run 33 = enum member resolution.** (1) Bare members (`GREEN`) never
+resolved — `register_enum()` now binds members into the global env
+(script/import/REPL/BC paths). (2) Explicit `= value` members didn't
+parse — body loop accepts `[= [-]int | member ± int]` with same-enum
+folding; effective values on a parallel `long long*`. (3) Post-error
+segfault (rc=139) — NULL-guarded `parse_assignment` panic path.
+Gauntlet 27/27 (new test_enum.rads), zero sanitizer reports. Commits
+`a7c8955` + `dc38a7a` pushed to fork.
 
 ## Run 31 (previous run — summary retained below)
 
