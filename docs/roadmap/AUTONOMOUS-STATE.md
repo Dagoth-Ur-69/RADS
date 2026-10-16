@@ -1,10 +1,76 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-15 (cron run 30)
+Last updated: 2026-10-15 (cron run 31)
 Branch: `phase0/build-recovery`
-HEAD: b09ec8a — fix(memory): imported program ASTs freed at teardown
+HEAD: 2dddeea — fix(memory): free partial statement AST on REPL parse-error path
 
 ## What this run changed
+
+**Run 31 = journal "Next up": the REPL statement-AST leak.** Dead.
+
+1. Root cause (run 30's 133 B / 3 residue, LSan differential in
+   scratch `rads-r31`): NOT per-clean-line — **error-path only**.
+   `parse_primary` fails on an unexpected token (e.g. `/exit;` →
+   `/`), sets `had_error`, returns NULL; `parse_factor` has no
+   NULL-check, re-consumes `/` as the division operator, parses
+   `exit` as an identifier, returns non-NULL
+   `binary_op(NULL, ident)` (ast.c:107 + ast.c:98/102). `run_repl`
+   (main.c ~471) on `had_error` freed only `source` and dropped the
+   partial tree. Script mode was already safe (parser.c:1558 frees
+   via `ast_list_free`).
+2. Attribution correction: run 30 attributed the 133 B/3 to clean
+   `echo add(1,2);` lines. Run 31 differential on the TRUE pristine
+   source (`git show 778da71:src/core/main.c`, sanitizer-built):
+   clean probe (structs, closures, fib(15), echo) = **0 leaks**;
+   `/exit;` poison = **133 B / 3 exact**. Run 30's probe session
+   must have included the error line (its lsan3.txt did: `/exit;`).
+3. Fix: REPL-side one chokepoint — `if (stmt) ast_free(stmt);` in
+   the `stmt == NULL || parser.had_error` branch of `run_repl`,
+   before `free(source)`. Chosen over parser-side NULL propagation
+   because `ast_free` is NULL-child-safe and nothing had borrowed
+   the tree (`interpret_repl_statement` never ran). 8 lines with
+   comment, applied identically in scratch then worktree.
+4. Instrumentation lesson (why run 31's first probes showed "no
+   leaks" everywhere): plain `make` builds are NOT
+   sanitizer-instrumented — `ASAN_OPTIONS=detect_leaks=1` on a
+   plain binary is a no-op. All leak verdicts REQUIRE
+   `make sanitize -j1` (serial — see hazards).
+
+## Test results (run 31)
+
+Scratch (`make sanitize -j1` builds, LSan): pristine(778da71) +
+poison **133 B/3** vs fixed + poison **0/0** (twice, incl. after
+negative-control restore); fixed + clean probe 0/0; pristine + clean
+probe 0/0 (attribution correction). Scratch `run_tests.sh` green.
+Worktree: `make clean && make -j$(nproc)` RC=0, gauntlet **26/26**
+green. Pushed to fork: `778da71..2dddeea`.
+
+## Known hazards (noted, not fixed — pre-existing)
+
+- `make sanitize -j` destroys the build tree (clean + order-only
+  dirs race under -j) — build sanitize serially (`-j1`); Makefile
+  hazard worth a dedicated fix run.
+- `turbo i32 c = GREEN;` echoes null — enum member resolution
+  semantics, identical in script mode; not a REPL regression.
+- Native-return values leak engine-wide (run 25 baseline class;
+  includes `str.split` tokens) — documented, tolerated.
+- Plain `make` binaries are not ASan-instrumented; any leak claim
+  made without a `make sanitize -j1` build is void (run 31 law).
+
+## Next up (single task for next run)
+
+1. **`make sanitize -j` build-tree self-destruction**: clean +
+   order-only dirs race under -j. Fix the Makefile (order-only
+   prerequisites on dirs / REMOVE the parallel-unsafe clean), prove
+   `make sanitize -j$(nproc)` works, then `make clean && make
+   -j$(nproc)` + gauntlet green. Small, high-leverage, kills a
+   standing hazard.
+
+Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
+ASan clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
+vs tree-walker output byte-for-byte, `git push fork` only.
+
+## Run 30 (previous run — summary retained below)
 
 **Run 30 = journal "Next up": the import sub-AST leak.** Dead.
 Scratch-first (rads-r30/build): baseline reproduced exactly —
@@ -37,39 +103,11 @@ Scratch (ASan/LSan build): p1.rads **152 B/3 → 0/0**; duplicate
 imports + imported struct + method-call-after-import stress probe
 0/0 with correct output; failed-parse import 0/0; bytecode A/B
 (`RADS_NO_BC=1` vs BC) **byte-identical**. REPL import probe:
-285 B/6 → 133 B/3 — the import component is dead; residue is a
-**pre-existing** REPL statement-AST leak (parser.c `parse_call` /
-`ast_create_binary_op` path), A/B-verified against a stashed clean
-build. Worktree: clean rebuild + gauntlet **26/26** green. Pushed
-to fork: `004ce40..b09ec8a`.
-
-## Known hazards (noted, not fixed — pre-existing)
-
-- **REPL statement-AST leak** (found this run): 133 B / 3 per REPL
-  line like `echo add(1,2);` — statement ASTs from
-  `interpret_repl_statement` never freed at exit (alloc sites:
-  `ast_create_binary_op` ast.c:107, `ast_create_identifier`
-  ast.c:98/102 via parser parse_call). **Next up.**
-- `make sanitize -j` destroys the build tree (clean + order-only
-  dirs race under -j) — build sanitize serially; Makefile hazard
-  worth a dedicated fix run.
-- `turbo i32 c = GREEN;` echoes null — enum member resolution
-  semantics, identical in script mode; not a REPL regression.
-- Native-return values leak engine-wide (run 25 baseline class;
-  includes `str.split` tokens) — documented, tolerated.
-
-## Next up (single task for next run)
-
-1. **REPL statement-AST leak**: `interpret_repl_statement` /
-   main.c REPL loop — statement ASTs parsed per line are never
-   freed at REPL exit (133 B / 3 per line, alloc sites above).
-   Same method: scratch-first LSan differential, ownership mapped
-   (REPL env values may borrow into the statement trees — audit
-   before freeing), both modes, A/B bytecode.
-
-Rules unchanged: compile-bail fallback, suite no-new-failures minimum,
-ASAN clean (pre-existing leaks tolerated), A/B with RADS_NO_BC=1, diff BC
-vs tree-walker output byte-for-byte, `git push fork` only.
+285 B/6 → 133 B/3 — the import component dead; residue attributed
+(by run 30, corrected by run 31) to the REPL statement path —
+run 31 proved it error-path-only (`/exit;`), fixed at 2dddeea.
+Worktree: clean rebuild + gauntlet **26/26** green. Pushed to fork:
+`004ce40..b09ec8a`.
 
 ## Run 29 (previous run — summary retained below)
 
@@ -673,3 +711,4 @@ the loop (run 16 hit 36k tokens, compaction exhausted). Concretely:
   optional semicolons / paren-free echo / dotted stdlib calls.
 - run 15: nightshift unified into phase0, mixed-float arithmetic fixed,
   45 commits pushed to fork Dagoth-Ur-69/RADS, upstream PR #19 open.
+
