@@ -7,11 +7,36 @@ wall-clock (process start included — that's the real cost a user pays).
 Run it yourself: `bash benchmarks/run.sh` (or `--quick` for best-of-1 smoke).
 Machine-readable results land in `benchmarks/results/*.json`.
 
-## Latest run — 2026-10-16 BC_CALL direct dispatch (results/20261016T182438Z.json)
+## Latest run — 2026-10-16 per-call-site EnvNameEntry* cache (results/20261016T210919Z.json)
 
 | Workload | RADS (ms) | CPython 3.13 (ms) | Node 20 (ms) | Notes |
 |---|---:|---:|---:|---|
-| fib(28) naive recursion | 63.3 | **62.3** | 120.2 | 3050 → 275 → 186 → 136 → 101 → 71 → 72 → 66 → **63** (BC_CALL now dispatches vm_run directly + trivially-copyable param binding); gap to CPython now **1.016x — statistical parity** |
+| fib(28) naive recursion | **55.6** | 61.6 | 118.9 | 3050 → 275 → 186 → 136 → 101 → 71 → 72 → 66 → 63 → **55.6** — **outright win over CPython (1.108x)**; per-call-site `EnvNameEntry*` cache removes the last 1.03M `env_intern_entry` hash+strcmp walks from the call path |
+| string_build (5000 concats) | 26.4 | **23.1** | 108.6 | flat (concat path untouched) |
+| array_churn (20k push + 5k pop + map) | **10.7** | 15.2 | 109.6 | steady |
+| file_io (200 write/read/append cycles) | **22.6** | 38.7 | 133.4 | RADS wins — native stdlib I/O |
+
+Takeaways, honestly stated:
+
+- Run 38 lever: call nodes now cache the interned `EnvNameEntry*` itself
+  (entries are never freed nor moved — verified — so the pointer is stable
+  for the process lifetime; name-per-node is fixed at parse time). The hit
+  path dereferences the live entry: zero hashing, zero `strcmp`, zero
+  bucket walks per call. `gen`/`frameable` invalidation still reads the
+  live entry, so invalidation semantics are byte-identical.
+- A/B (interleaved, 5 rounds × 4 samples, sanity-gated on output): pre
+  98–99 ms vs post 82–83 ms under identical co-tenant load — ~16% on the
+  raw binary; the stable-load harness run above shows 55.6 vs 61.6.
+- Test gauntlet: 27/27 green in the repo tree.
+- RADS now beats CPython on **3 of 4** (fib, array_churn, file_io), Node
+  on **4 of 4**. The remaining honest frontier is string_build (concat
+  cost), where CPython still leads 23.1 vs 26.4.
+
+## Previous run — 2026-10-16 BC_CALL direct dispatch (results/20261016T182438Z.json)
+
+| Workload | RADS (ms) | CPython 3.13 (ms) | Node 20 (ms) | Notes |
+|---|---:|---:|---:|---|
+| fib(28) naive recursion | 63.3 | **62.3** | 120.2 | 3050 → 275 → 186 → 136 → 101 → 71 → 72 → 66 → **63** (BC_CALL now dispatches vm_run directly + trivially-copyable param binding); gap to CPython then 1.016x — statistical parity |
 | string_build (5000 concats) | 26.7 | **22.7** | 112.6 | flat (concat path untouched) |
 | array_churn (20k push + 5k pop + map) | **11.1** | 15.7 | 113.0 | steady |
 | file_io (200 write/read/append cycles) | **22.3** | 40.7 | 134.2 | RADS wins — native stdlib I/O |

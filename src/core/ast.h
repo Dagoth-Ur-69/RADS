@@ -258,6 +258,7 @@ struct ASTNode {
             // native table's generation.
             const void* cache_binding; // Environment* in global_env, or NULL
             void* cache_native;        // NativeFn, or NULL
+            void* cache_nentry;        // EnvNameEntry* (interpreter.c), interned once per node
             const char* cache_iname;   // interned callee name
             unsigned cache_gen;        // name generation at cache time (0 = empty)
             unsigned cache_native_gen; // native-table generation at cache time

@@ -837,7 +837,19 @@ static void resolve_callee_cached(ASTNode* node, const char* name, bool cacheabl
     EnvNameEntry* cache_entry = NULL;
 
     if (cacheable) {
-        cache_entry = env_intern_entry(name);
+        // Perf round 6: EnvNameEntry objects are interned for the process
+        // lifetime (never freed, never moved), so the entry POINTER is
+        // cached per call-site node — the hit path dereferences the live
+        // entry and never re-hashes/re-strcmps the name (~1M calls on
+        // fib(28)). gen/frameable are still read off the live entry, so
+        // invalidation semantics are byte-identical to re-interning.
+        EnvNameEntry* entry = node->call_expr.cache_nentry;
+        if (entry) {
+            cache_entry = entry;
+        } else {
+            cache_entry = env_intern_entry(name);
+            node->call_expr.cache_nentry = cache_entry;
+        }
         if (cache_entry->frameable) {
             cache_entry = NULL; // dynamic: never cache
         } else if (node->call_expr.cache_iname == cache_entry->name &&

@@ -247,6 +247,7 @@ ASTNode* ast_create_call(ASTNode* callee, ASTList* arguments, int line, int colu
     node->call_expr.arguments = arguments;
     node->call_expr.cache_binding = NULL;
     node->call_expr.cache_native = NULL;
+    node->call_expr.cache_nentry = NULL;
     node->call_expr.cache_iname = NULL;
     node->call_expr.cache_gen = 0;
     node->call_expr.cache_native_gen = 0;
