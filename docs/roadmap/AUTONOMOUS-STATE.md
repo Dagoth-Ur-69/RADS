@@ -1,8 +1,56 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-16 (cron run 38)
+Last updated: 2026-10-17 (cron run 39)
 Branch: `phase0/build-recovery`
-HEAD: a40a35c — perf(core): cache interned EnvNameEntry* per call-site
+HEAD: f762bd3 — perf(core): BC_CONCAT fused concat chains
+
+## Run 39 — 2026-10-17: BC_CONCAT — fused left-anchored concat chains (string_build round 1, ONE lever)
+
+**What changed:** the last losing benchmark, string_build, paid GETL's
+full-buffer `strdup` clone of the accumulator plus one re-`strlen` of the
+growing buffer per BC_BIN (~8×L bytes of traffic per iteration vs CPython's
+~3×L). New opcode `BC_CONCAT` (imm: u16 slot, u8 n, cap 32). Compile site
+(in `bc_compile_stmt`, right after the round-8 `BC_SLOT_BIN` check): walk
+the OP_ADD left spine of `s = s + p1 + ... + pn`; if the leftmost atom is
+an identifier resolving to the assigned slot, compile pieces in source
+order and emit one `BC_CONCAT` (else fall through to the generic path —
+round 8's shape check requires a bare-identifier lhs, so benchmark-shaped
+chains like `s = s + "rads" + i + ";"` previously never fused). Runtime
+fast path (slot + all pieces str/int): one strlen measure pass, one
+malloc, one memcpy per piece; frees piece strings, frees the old slot
+buffer. Slow path: sequential `binop_apply` fold — bit-identical to the
+unfused GETL + n×BC_BIN + SETL_POP sequence.
+
+**Method honored:** pre-patch binary captured FIRST (`rads-pre`, 21:19),
+then patched, rebuilt, A/B'd. `make` clean (only pre-existing warnings).
+
+**A/B on the raw binary (interleaved 5×5, string_build.rads direct):** pre
+28–30 ms vs post 14–16 ms — ~2x on the workload, non-overlapping.
+
+**Semantics probes:** BC vs tree-walker (`RADS_NO_BC=1`) outputs
+byte-identical across 8 chain shapes: benchmark shape head/tail contains,
+float piece (slow path), call piece, 40-piece chain (over cap → no fuse),
+negative int, slot-read piece, bool piece, bool+null chain, empty
+accumulator. All green.
+
+**Benchmark harness (best-of-3, results/20261017T002259Z.json):**
+string_build **13.4 vs CPython 22.4 (1.67x — OUTRIGHT WIN**); fib 56.9 vs
+63.6 (steady win); array_churn **10.7 vs 16.5**; file_io **21.5 vs 37.8**.
+**RADS now beats CPython 4 of 4 and Node 4 of 4 — clean sweep.**
+
+**Test results:** 27/27 green in the repo tree (`bash run_tests.sh`).
+
+**Commits:** `f762bd3` (perf + RESULTS.md + result JSON). Pushed to fork
+`phase0/build-recovery`. Tree clean.
+
+**Next up (run 40) — pick ONE:**
+- (a) Defend the sweep: add regression tests for BC_CONCAT semantics (the
+  8 probe shapes) to the gauntlet, and re-run the full harness 3× to
+  confirm stability of the clean sweep.
+- (b) fib round 5: cache `find_native` result alongside the entry (one
+  more integer compare on the hit path) — small but measured.
+Recommend (a): a sweep that isn't regression-guarded is a claim, not a
+result.
 
 ## Run 38 — 2026-10-16: per-call-site EnvNameEntry* cache (fib round 4, ONE lever)
 
