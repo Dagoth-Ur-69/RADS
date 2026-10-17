@@ -28,6 +28,7 @@ test_files=(
     "test_heapq.rads"
     "test_logging.rads"
     "test_statistics.rads"
+    "test_nostalgia.rads"
 )
 
 for test_file in "${test_files[@]}"; do
