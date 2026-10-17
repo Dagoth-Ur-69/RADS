@@ -1,8 +1,65 @@
 # RADS Autonomous State — handoff journal
 
-Last updated: 2026-10-17 (cron run 39)
+Last updated: 2026-10-17 (cron run 40)
 Branch: `phase0/build-recovery`
-HEAD: f762bd3 — perf(core): BC_CONCAT fused concat chains
+HEAD: 5a9784c — bench: run-40 3x stability re-run
+
+## Run 40 — 2026-10-17: BC_CONCAT audit + regression guard (defend the sweep)
+
+**What changed:** run 39's "Next up" option (a): defend the clean sweep.
+Two deliverables — (1) an ownership/leak audit of the BC_CONCAT slow path,
+(2) promotion of the 8 run-39 probe shapes into the gauntlet, plus the 3×
+harness stability re-run.
+
+**The audit (the interesting part):** the run-39 handoff carried a leak
+hypothesis — the fused slow path folds through `binop_apply` "which does
+not consume operands". I built the ASan/LSan scratch tree (run-13 law) and
+probed: fused-slow / unfused-control / fused-fast, 2M iterations each.
+LSan reported ZERO leaks on all three — including the control that should
+have leaked if the hypothesis held. Verified LSan itself works on this
+host (42-byte canary fires). RSS peak told the seductive lie: slow path
++94MB vs fast path — but the "unfused control" showed MORE (+124MB),
+exposing it as ASan quarantine churn proportional to allocation rate,
+not leaks. Then the decisive instrument: I wrote the "fix" (release
+pieces + superseded accumulator per fold) — and ASan aborted with a
+**double-free** at `binop_apply`'s tail (interpreter.c:1380): its cleanup
+runs `value_free(&left); value_free(&right);` — **binop_apply CONSUMES its
+operands.** The mid-function read that fed the hypothesis stopped before
+the tail. Verdict: run-39 code was already correct; LSan silence was
+truth. Patch fully reverted; the slow-path comment now documents the
+ownership contract so no future run re-litigates it. Lesson recorded:
+read the WHOLE callee before concluding ownership; ASan is the judge,
+RSS deltas under sanitizers are not evidence.
+
+**Regression guard:** `tests/test_bc_concat.rads` (9th file convention
+`test.describe`/`test.it`/`test.expect().toBe()`, ends `test.run()`).
+Covers all 8 shapes: benchmark shape, float piece (slow path), call
+piece, 40-piece over-cap chain, negative int, slot-read piece,
+bool+null fold, empty accumulator. Verified green on BOTH the BC path
+and the tree-walker (`RADS_NO_BC=1`), and negative-probed — a sabotaged
+expectation fails rc=1 (the run-23 exit latch works; the earlier
+silent-pass scare was a missing `test.run()` call in my first draft,
+not a framework fault).
+
+**Harness 3× stability:** fresh build, `run.py --quick` ×3
+(results/20261017T03240{3,4,5}Z.json): RADS fastest **12 of 12**.
+fib 53.7/57.4/62.5 vs CPython 61.3/62.7/62.6 (run 3 margin: 0.1ms —
+won, but thin; fib remains the softest win). string_build 15.9/13.8/14.1
+vs 22.5–23.3. array_churn 11.7/10.8/11.4. file_io 24.0/23.8/23.1.
+
+**Test results:** 28/28 green (`make clean && make -j && bash run_tests.sh`).
+
+**Commits:** `0e36755` (audit comment + regression guard), `5a9784c`
+(3× stability results + RESULTS.md). Pushed to fork `phase0/build-recovery`.
+Tree clean.
+
+**Next up (run 41) — pick ONE:**
+- (a) fib round 5: cache `find_native` result alongside the call node's
+  EnvNameEntry* — one more integer compare on the hit path; the fib margin
+  (0.1ms on run 3) says the call path still has headroom.
+- (b) LSP foundations (workstream 4): hover + diagnose for the tree-walker
+  errors — moves the "competitor to TypeScript" story forward.
+Recommend (a): cheapest defense of the weakest number in the sweep.
 
 ## Run 39 — 2026-10-17: BC_CONCAT — fused left-anchored concat chains (string_build round 1, ONE lever)
 
