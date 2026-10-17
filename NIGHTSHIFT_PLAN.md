@@ -25,6 +25,7 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
   (26 assertions, wired into run_tests.sh → 10/10) + examples/nostalgia_museum.rads;
   (3) .gitignore: benchmarks/, root symlinks, rads-mask binary (backlog #4 done). gh auth NOW
   AVAILABLE (Dagoth-Ur-69, repo scope) — old blocker dead; branch pushed, PR opened.
+- **2026-10-17 (verification fire)**: first fully autonomous pipeline run end-to-end. (1) Sync: fetch origin+fork green, PR #20 (nostalgia+clean-build-fix) verified OPEN and left unmerged; (2) bb7db17 feat(stdlib): **nostalgia.pool_closed()** — Habbo Hotel July 2006 exhibit (canonical cry + backstory plaque), 4 new assertions, museum example Habbo wing rewired; nostalgia suite 30 PASS/0 FAIL, runner 10/10 from clean tree, make clean && make -j4 exit 0; (3) pushed to fork, PR #20 updated with comment (no dup PR): https://github.com/zarigata/RADS/pull/20#issuecomment-6239520889. Runner gap confirmed again: per-suite FAIL lines are swallowed by exit-code-only gate — v2_0_0 tests must always be grepped by hand.
 - **2026-10-13**: (1) `27b8b67` on `nightshift/20261013-stdlib-float-parity` — mixed int/float
   arithmetic (`-`,`*`,`/`,`%` w/ zero guards), `make_error()` helper, heapq/logging/statistics real-API
   port + 3 test suites; (2) `5a02649` — runner learns the 3 suites (9/9), exec bit restored;
@@ -41,7 +42,7 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 ## Open PR Review
 | PR | Title | Status | Verdict |
 |----|-------|--------|---------|
-| — | (none reviewable) | gh auth unavailable | skip |
+| 20 | nostalgia module + clean-build fix for main | OPEN — head Dagoth-Ur-69:nightshift/20261017-forge-sync, +1 comment (pool_closed, bb7db17) | awaiting master review; carries the main clean-build fix |
 
 ## Ranked Backlog (next shifts)
 1. **Merge stdlib branch** (unlocks clean builds of main) once auth exists; then CI should run
