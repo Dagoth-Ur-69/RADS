@@ -35,6 +35,11 @@ Takeaways, honestly stated:
 - Test gauntlet: 27/27 green in the repo tree.
 - **RADS now beats CPython on 4 of 4 and Node on 4 of 4.** string_build was
   the last honest deficit; the suite is clean-sweep.
+- Run 40 stability check: full harness re-run 3× (results/
+  20261017T03240{3,4,5}Z.json) — RADS fastest in **12 of 12** comparisons;
+  worst margin fib 62.5 vs 62.6 (run 3), all others comfortable. The sweep
+  is also regression-guarded now: run 39's 8 probe shapes live in the
+  gauntlet as `tests/test_bc_concat.rads` (28 tests total).
 
 ## Previous run — 2026-10-16 per-call-site EnvNameEntry* cache (results/20261016T210919Z.json)
 
