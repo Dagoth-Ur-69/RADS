@@ -2199,11 +2199,18 @@ typedef enum {
     BC_ALEN,     // pop array/dict, push int count (run 24 — comprehension loop bound)
     BC_APPEND,   // imm: u16 slot — pop value; append into local[slot] array (run 24)
     BC_DSTORE,   // imm: u16 slot — pop value, key; dict_store into local[slot] dict (run 24)
-    BC_CMPF      // imm: u16 slot, u8 op, i64 rhs, u16 abs offset — fused compare-and-branch:
+    BC_CMPF,     // imm: u16 slot, u8 op, i64 rhs, u16 abs offset — fused compare-and-branch:
                  // if !(local[slot] <op> rhs) jump. No stack traffic, no clone (round 10).
                  // Mirrors GETL+INT+BIN(op)+JMPF exactly for int slots; non-int slots
                  // reproduce binop_apply's null/false/true result + bc_truthy fold.
+    BC_CONCAT    // imm: u16 slot, u8 n — pop n pieces; local[slot] = local[slot] + p1
+                 // + ... + pn fused (round 12, run 39). Fast path when slot and all
+                 // pieces are str/int: one measure pass, one alloc, one memcpy per
+                 // piece — replaces GETL full clone + n × BC_BIN each re-strlen of the
+                 // growing buffer. Any other shape folds sequentially through
+                 // binop_apply, identical to the unfused sequence.
 } BcOpcode;
+#define BC_CONCAT_MAX 32
 // --- break/continue patch lists (perf round 5: loops) ---
 // BREAK/CONTINUE compile to a plain BC_JMP whose operand is recorded here
 // and fixed up by the innermost enclosing loop when it closes. Correct even
@@ -2834,6 +2841,51 @@ static bool bc_compile_stmt(BcCompiler* c, ASTNode* s) {
                         bc_put(c, BC_SLOT_BIN);
                         bc_put16(c, (uint16_t)slot);
                         bc_put(c, (uint8_t)aop);
+                        return true;
+                    }
+                }
+                // Perf round 12 (run 39): fuse left-anchored string-concat
+                // chains `s = s + a + b + ... + z` where the leftmost atom of
+                // the + spine IS the assigned slot. Compiles to one BC_CONCAT
+                // instead of GETL(full clone)+n×BC_BIN(each re-strlen of the
+                // growing buffer)+SETL_POP. Right operands are compiled in
+                // source order (evaluation order preserved); no reassociation
+                // of anything that isn't a literal/slot read, so semantics
+                // match the unfused fold bit-for-bit.
+                if (s->assign_expr.value &&
+                    s->assign_expr.value->type == AST_BINARY_OP &&
+                    s->assign_expr.value->binary_op.op == OP_ADD &&
+                    bc_slot_of(c, name) >= 0) {
+                    // Walk the left spine; collect right operands (pieces).
+                    ASTNode* pieces[BC_CONCAT_MAX];
+                    int npieces = 0;
+                    bool ok = true;
+                    for (ASTNode* cur = s->assign_expr.value; cur; cur = cur->binary_op.left) {
+                        if (cur->type == AST_BINARY_OP && cur->binary_op.op == OP_ADD) {
+                            if (npieces >= BC_CONCAT_MAX) { ok = false; break; }
+                            pieces[npieces++] = cur->binary_op.right;
+                        } else if (cur->type == AST_IDENTIFIER &&
+                                   bc_slot_of(c, cur->identifier.name) ==
+                                       bc_slot_of(c, name)) {
+                            break; // leftmost atom reached
+                        } else {
+                            ok = false; break;
+                        }
+                    }
+                    if (ok && npieces > 0) {
+                        // pieces[] was filled outside-in (rightmost first);
+                        // reverse to source order for emission.
+                        for (int i = 0; i < npieces/2; i++) {
+                            ASTNode* t = pieces[i];
+                            pieces[i] = pieces[npieces-1-i];
+                            pieces[npieces-1-i] = t;
+                        }
+                        int slot = bc_slot_of(c, name);
+                        for (int i = 0; i < npieces; i++)
+                            if (!bc_compile_expr(c, pieces[i])) return false;
+                        bc_put(c, BC_CONCAT);
+                        bc_put16(c, (uint16_t)slot);
+                        bc_put(c, (uint8_t)npieces);
                         return true;
                     }
                 }
@@ -3535,6 +3587,67 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                 }
                 break;
             }
+            case BC_CONCAT: {
+                 // Perf round 12 (run 39): fused left-anchored concat chain.
+                 // imm: u16 slot, u8 n. Pops n pieces (pushed in source order).
+                 // Fast path when slot and all pieces are str/int: one measure
+                 // pass, one malloc, one memcpy per piece — no growing-buffer
+                 // re-strlen, no intermediate clones. Any other shape folds
+                 // left-to-right through binop_apply exactly like the unfused
+                 // GETL + n×BC_BIN + SETL_POP sequence.
+                 uint16_t cslot = ip[0] | (ip[1] << 8);
+                 uint8_t ncat = ip[2];
+                 ip += 3;
+                 Value pieces[BC_CONCAT_MAX];
+                 for (int i = ncat - 1; i >= 0; i--) BC_POP(pieces[i]);
+                 Value* dst = &slots[cslot];
+                 bool fast = dst->type == VAL_STRING;
+                 if (fast) {
+                     for (int i = 0; i < ncat; i++) {
+                         if (pieces[i].type != VAL_STRING &&
+                             pieces[i].type != VAL_INT) { fast = false; break; }
+                     }
+                 }
+                 if (fast) {
+                     size_t total = strlen(dst->string_val);
+                     for (int i = 0; i < ncat; i++) {
+                         if (pieces[i].type == VAL_STRING)
+                             total += strlen(pieces[i].string_val);
+                         else {
+                             char b[32];
+                             total += (size_t)snprintf(b, sizeof(b), "%lld",
+                                                       pieces[i].int_val);
+                         }
+                     }
+                     char* s = malloc(total + 1);
+                     char* w = s;
+                     size_t len = strlen(dst->string_val);
+                     memcpy(w, dst->string_val, len); w += len;
+                     for (int i = 0; i < ncat; i++) {
+                         if (pieces[i].type == VAL_STRING) {
+                             len = strlen(pieces[i].string_val);
+                             memcpy(w, pieces[i].string_val, len); w += len;
+                             free(pieces[i].string_val);
+                         } else {
+                             w += snprintf(w, 32, "%lld", pieces[i].int_val);
+                         }
+                     }
+                     *w = '\0';
+                     free(dst->string_val);
+                     dst->type = VAL_STRING;
+                     dst->string_val = s;
+                 } else {
+                     // Slow path: sequential fold, identical to the unfused
+                     // sequence (GETL clone + n × BC_BIN + SETL_POP).
+                     Value acc = value_clone_impl(*dst);
+                     for (int i = 0; i < ncat; i++) {
+                         acc = binop_apply(OP_ADD, acc, pieces[i]);
+                     }
+                     value_free(dst);
+                     *dst = acc;
+                 }
+                 break;
+             }
             default:
                 goto bad_opcode;
         }

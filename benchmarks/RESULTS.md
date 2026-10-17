@@ -7,7 +7,36 @@ wall-clock (process start included — that's the real cost a user pays).
 Run it yourself: `bash benchmarks/run.sh` (or `--quick` for best-of-1 smoke).
 Machine-readable results land in `benchmarks/results/*.json`.
 
-## Latest run — 2026-10-16 per-call-site EnvNameEntry* cache (results/20261016T210919Z.json)
+## Latest run — 2026-10-17 BC_CONCAT fused concat chains (results/20261017T002259Z.json)
+
+| Workload | RADS (ms) | CPython 3.13 (ms) | Node 20 (ms) | Notes |
+|---|---:|---:|---:|---|
+| fib(28) naive recursion | **56.9** | 63.6 | 117.1 | steady (call-path untouched this run) |
+| string_build (5000 concats) | **13.4** | 22.4 | 108.6 | 26.4 → **13.4** — new BC_CONCAT opcode fuses left-anchored `s = s + a + b + c` chains into one measure-alloc-copy pass; **outright win over CPython (1.67x)** |
+| array_churn (20k push + 5k pop + shape map) | **10.7** | 16.5 | 115.8 | steady |
+| file_io (200 write/read/append cycles) | **21.5** | 37.8 | 132.2 | RADS wins — native stdlib I/O |
+
+Takeaways, honestly stated:
+
+- Run 39 lever: `BC_CONCAT` (imm: u16 slot, u8 n). The compile site walks the
+  left spine of an `s = s + p1 + ... + pn` OP_ADD tree whose leftmost atom is
+  the assigned slot itself, compiles pieces in source order, then emits one
+  opcode. Runtime fast path (slot + all pieces str/int): one strlen measure
+  pass, one malloc, one memcpy per piece — replaces GETL's full-buffer strdup
+  clone plus n × BC_BIN each re-strlen of the growing buffer (~8×L traffic
+  down to ~2×L per iteration). Any other shape (float/bool/null pieces, calls
+  are fine — they're compiled as piece expressions) folds sequentially through
+  `binop_apply`, bit-identical to the unfused GETL + n×BC_BIN + SETL_POP.
+- A/B on the raw binary (interleaved, 5×5, sanity-gated): pre 28–30 ms vs
+  post 14–16 ms — ~2x on the workload itself.
+- Semantics probes: BC vs tree-walker (RADS_NO_BC=1) byte-identical output
+  across 8 chain shapes (fast path, float/bool/null slow path, call pieces,
+  40-piece chain over the cap, negative ints, slot reads, empty accumulators).
+- Test gauntlet: 27/27 green in the repo tree.
+- **RADS now beats CPython on 4 of 4 and Node on 4 of 4.** string_build was
+  the last honest deficit; the suite is clean-sweep.
+
+## Previous run — 2026-10-16 per-call-site EnvNameEntry* cache (results/20261016T210919Z.json)
 
 | Workload | RADS (ms) | CPython 3.13 (ms) | Node 20 (ms) | Notes |
 |---|---:|---:|---:|---|
