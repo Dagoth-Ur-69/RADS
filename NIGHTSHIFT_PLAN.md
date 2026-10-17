@@ -16,6 +16,15 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 **clean-build green** (trio 11+8+17 PASS, runner 9/9, exit 0). Merge that branch to unblock main.
 
 ## Night Log
+- **2026-10-17**: (1) merged `nightshift/20261013-stdlib-float-parity` into new branch
+  `nightshift/20261017-forge-sync` — **CRITICAL DISCOVERY closed**: `make clean && make -j4` exit 0 from
+  a clean tree, main-line stdlib unblocked; (2) `79e122e` feat(stdlib): **nostalgia module** — the
+  Museum of the 2000s Internet, 19 natives (leek_spin, rickroll, all_your_base, over9000, leeroy,
+  badger_badger, pbj_time, hamster_dance, o_rly/ya_rly, the_game, barrel_roll, charlie_bit_me,
+  keyboard_cat, dramatic_chipmunk, msn_nudge, asl, away_message, leetspeak) + test_nostalgia.rads
+  (26 assertions, wired into run_tests.sh → 10/10) + examples/nostalgia_museum.rads;
+  (3) .gitignore: benchmarks/, root symlinks, rads-mask binary (backlog #4 done). gh auth NOW
+  AVAILABLE (Dagoth-Ur-69, repo scope) — old blocker dead; branch pushed, PR opened.
 - **2026-10-13**: (1) `27b8b67` on `nightshift/20261013-stdlib-float-parity` — mixed int/float
   arithmetic (`-`,`*`,`/`,`%` w/ zero guards), `make_error()` helper, heapq/logging/statistics real-API
   port + 3 test suites; (2) `5a02649` — runner learns the 3 suites (9/9), exec bit restored;
@@ -25,9 +34,9 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
   `run_tests.sh` 9/9 on stdlib branch. Push attempted, failed (no creds) — commits local per protocol.
 
 ## Blockers
-- **gh auth unavailable** — `gh auth login` never run, no GH_TOKEN; cannot list/review PRs, cannot
-  push branches or open PRs. All commits held locally on branches as instructed.
-- credentials needed to merge the main-unlocking stdlib branch (see CRITICAL DISCOVERY).
+- ~~gh auth unavailable~~ **RESOLVED 2026-10-17** — gh logged in as Dagoth-Ur-69 (repo scope);
+  stdlib-fix branch merged on `nightshift/20261017-forge-sync`; clean build green.
+- MAIN SYNC: origin/main (f9d2c82) still cannot clean-build until the merge lands on main via PR.
 
 ## Open PR Review
 | PR | Title | Status | Verdict |
