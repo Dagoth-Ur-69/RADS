@@ -4,8 +4,8 @@
 blast main() {
     echo("=== WELCOME TO THE MUSEUM OF THE 2000s INTERNET ===");
     echo("");
-    echo("[Habbo Hotel, 2001]");
-    echo("  " + nostalgia.leetspeak("habbo hotel pool") + " -- POOL'S CLOSED.");
+    echo("[Habbo Hotel, July 2006]");
+    echo("  " + nostalgia.pool_closed());
     echo("");
     echo("[leekspin.net, 2006]");
     echo("  " + nostalgia.leek_spin(0));

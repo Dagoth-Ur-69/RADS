@@ -71,6 +71,17 @@ blast main() {
     if (nostalgia.leetspeak("xyz") == "xyz") { echo("PASS: leetspeak leaves others alone"); }
     else { echo("FAIL: leetspeak touched xyz"); }
 
+    // Habbo Hotel, July 2006 -- the raid that closed every pool
+    if (str.contains(nostalgia.pool_closed(), "POOL")) { echo("PASS: pool_closed announces the closure"); }
+    else { echo("FAIL: pool is mysteriously open"); }
+    if (str.contains(nostalgia.pool_closed(), "CLOSED")) { echo("PASS: pool_closed has the canonical cry"); }
+    else { echo("FAIL: pool lost the canonical cry"); }
+
+    if (str.contains(nostalgia.pool_closed(), "2006")) { echo("PASS: pool_closed plaque has the 2006 backstory"); }
+    else { echo("FAIL: plaque lost the backstory"); }
+    if (nostalgia.pool_closed() != nostalgia.the_game()) { echo("PASS: pool_closed distinct from the_game"); }
+    else { echo("FAIL: exhibits collided"); }
+
     // the game — you know what you did
     if (str.contains(nostalgia.the_game(), "lost The Game")) { echo("PASS: you lost The Game (test edition)"); }
     else { echo("FAIL: The Game lost you"); }

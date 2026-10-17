@@ -137,6 +137,17 @@ Value native_nostalgia_msn_nudge(struct Interpreter* interp, int argc, Value* ar
                        "whole window, and your soul, 1999-2000s)");
 }
 
+/* -- Habbo Hotel (2006): the Pool's Closed blockade --
+ * On July 6, 2006, raiders in grey suits and enormous afros formed
+ * wall-to-wall lines around every Habbo Hotel pool and declared it
+ * closed. The mods could not ban them fast enough; the wall held.
+ * WHY: the most famous coordinated raid of 2006 -- the museum needs its plaque.
+ * EXTEND: a variant arg could return the dress code (grey suit + afro). */
+Value native_nostalgia_pool_closed(struct Interpreter* interp, int argc, Value* args) {
+    (void)interp; (void)argc; (void)args;
+    return make_string("POOL'S CLOSED! (Habbo Hotel, July 2006: a wall of grey suits and afros sealed the pool; the mods banned in vain)");
+}
+
 Value native_nostalgia_asl(struct Interpreter* interp, int argc, Value* args) {
     (void)interp; (void)argc; (void)args;
     return make_string("a/s/l? (the three scariest letters on 2000s IRC and AIM)");
@@ -186,6 +197,7 @@ void stdlib_nostalgia_register(void) {
     register_native("nostalgia.all_your_base",    native_nostalgia_all_your_base);
     register_native("nostalgia.over9000",         native_nostalgia_over9000);
     register_native("nostalgia.leeroy",           native_nostalgia_leeroy);
+    register_native("nostalgia.pool_closed",      native_nostalgia_pool_closed);
     register_native("nostalgia.badger_badger",    native_nostalgia_badger);
     register_native("nostalgia.pbj_time",         native_nostalgia_pbj_time);
     register_native("nostalgia.hamster_dance",    native_nostalgia_hamster_dance);
