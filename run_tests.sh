@@ -45,6 +45,7 @@ test_files=(
     "test_v0.0.12.rads"
     "test_http.rads"
     "test_enum.rads"            # run 33: bare member resolution + explicit values
+    "test_bc_concat.rads"       # run 40: BC_CONCAT fused-chain regression guard (run 39's 8 probe shapes)
 )
 
 for test_file in "${test_files[@]}"; do

@@ -3639,6 +3639,13 @@ static Value vm_run(BcFunc* f, int argc, Value* args) {
                  } else {
                      // Slow path: sequential fold, identical to the unfused
                      // sequence (GETL clone + n × BC_BIN + SETL_POP).
+                     // Run 40 audit: binop_apply CONSUMES its operands (its
+                     // tail runs value_free on both by-value inputs), so the
+                     // pieces are freed by each fold and the folded acc is
+                     // carried to *dst — no leak. LSan-clean over 2M-iter
+                     // probes; RSS deltas vs the fast path are ASan
+                     // quarantine churn, not leaks (an added value_release
+                     // here double-frees — caught by ASan, reverted).
                      Value acc = value_clone_impl(*dst);
                      for (int i = 0; i < ncat; i++) {
                          acc = binop_apply(OP_ADD, acc, pieces[i]);
