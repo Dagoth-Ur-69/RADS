@@ -16,6 +16,18 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 **clean-build green** (trio 11+8+17 PASS, runner 9/9, exit 0). Merge that branch to unblock main.
 
 ## Night Log
+- **2026-10-18**: (1) sync: fetch origin+fork green, PRs #19/#20 still open, none merged — cut
+  `nightshift/20261018-re-named-groups` from `nightshift/20261017-forge-sync` head (freshest green);
+  (2) `6ff4beb` feat(stdlib): **regex named groups** — `(?P<name>...)` + `(?<name>...)` lowered to POSIX ERE
+  at cache time (regcomp has no named groups; name->capture-index map kept per cached pattern),
+  `regex.named_groups()` groupdict-style struct (null on no match, "" for non-participating optional),
+  `regex.group_names()` declaration order, `\g<name>`/`\g<1>`/`\1` backrefs in replace, duplicate names
+  rejected, lookarounds rejected with clear errors; (3) **fix: regex.replace heap overflow** — old
+  `2*len(str)+2*len(repl)` sizing smashed the heap on many-match expansion (ASan-confirmed WRITE past
+  300-byte region, repro preserved); grow-on-demand GrowBuf replaces it; (4) tests/test_regex.rads 20
+  assertions wired into run_tests.sh (11 suites). Verified: clean build exit 0, 11 suites 0 FAIL lines,
+  regex suite 20/20, ASan build 20/20 with 0 findings. PR #21 opened:
+  https://github.com/zarigata/RADS/pull/21
 - **2026-10-17**: (1) merged `nightshift/20261013-stdlib-float-parity` into new branch
   `nightshift/20261017-forge-sync` — **CRITICAL DISCOVERY closed**: `make clean && make -j4` exit 0 from
   a clean tree, main-line stdlib unblocked; (2) `79e122e` feat(stdlib): **nostalgia module** — the
@@ -34,6 +46,14 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
   grep of CI/scripts/Makefile/run_tests.sh found zero references. `make clean && make -j4` = exit 0,
   `run_tests.sh` 9/9 on stdlib branch. Push attempted, failed (no creds) — commits local per protocol.
 
+## Standing gotchas
+- RADS string literals are RAW (parser does no escape unescaping): `.rads` source writes ONE backslash
+  per escape (`"\("`, `"\g<1>"`), not Python's two. Tests that assume Python escaping will fail.
+- Strings have no `.length` (arrays only) — use `str.count()` or comparisons.
+- ASan full-tree build: src/debug has duplicate symbols between debug_protocol.c and
+  conditional_breakpoints.c (debug_step_out, debug_get_stack_trace et al.) — build with only
+  conditional_breakpoints.c until deduped (bughunt backlog candidate).
+
 ## Blockers
 - ~~gh auth unavailable~~ **RESOLVED 2026-10-17** — gh logged in as Dagoth-Ur-69 (repo scope);
   stdlib-fix branch merged on `nightshift/20261017-forge-sync`; clean build green.
@@ -43,11 +63,12 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 | PR | Title | Status | Verdict |
 |----|-------|--------|---------|
 | 20 | nostalgia module + clean-build fix for main | OPEN — head Dagoth-Ur-69:nightshift/20261017-forge-sync, +1 comment (pool_closed, bb7db17) | awaiting master review; carries the main clean-build fix |
+| 21 | regex named groups + replace heap-overflow fix | OPEN — head Dagoth-Ur-69:nightshift/20261018-re-named-groups | awaiting master review; top backlog parity item |
 
 ## Ranked Backlog (next shifts)
 1. **Merge stdlib branch** (unlocks clean builds of main) once auth exists; then CI should run
    `make clean && make` — never trust cached objects.
-2. Stdlib parity: Python `re` gaps (named groups), `datetime.strptime` round-trip, `decimal`,
+2. Stdlib parity: `datetime.strptime` round-trip, `decimal`,
    `fractions`, `itertools` lazy generators; TS parity: optional chaining `?.`, nullish `??`,
    template literals, `Promise.allSettled`.
 3. Sweep `-Wunused`/`-Wformat` warnings (rads-mask sprintf overflow is a real stack-smash risk).
