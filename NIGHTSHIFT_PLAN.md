@@ -16,6 +16,8 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 **clean-build green** (trio 11+8+17 PASS, runner 9/9, exit 0). Merge that branch to unblock main.
 
 ## Night Log
+- **2026-10-20**: (1) sync: fetch origin+fork green, PRs #19/#20/#21 still open, none merged; found last nights run DEAD MID-FLIGHT (HTTP 429) with uncommitted strptime work on branch nightshift/20261019-datetime-strptime — recovered it, deleted junk placeholder file, finished the unit; (2) 4d7ed09 feat(stdlib): **datetime.strptime/strftime Python-parity engine** — full rewrite (+1000/-431): format->POSIX ERE lowered at cache time, CPython _strptime semantics (case-insensitive names, non-padded numbers, %I/%p 12h, %j julian, %U/%W weeks, %G-%V-%u ISO week dates, %z-aware epochs, 1900 default year, strict rejections: trailing garbage/Feb 30/hour 24/%G-without-%V -> null), strftime side exact Howard Hinnant civil math (no mktime/locale), composites %c/%x/%X/%F/%D/%T/%R/%r, glibc unknown-directive passthrough ("100%% %q" -> "100% %q"), legacy YYYY-MM-DD dialect kept; (3) bugs fixed en route: dt_unpack int-smash (month=0 -> MONTH_FULL[-1] segfault), format %% literal wrong output — the FAIL line was buried by the exit-code-only runner AGAIN (house grep law 3-for-3); (4) tests/test_datetime.rads 38 assertions wired into run_tests.sh (12 suites). Verified: clean build exit 0 (0 warnings from stdlib_datetime.c), 12/12 suites 0 FAIL lines, ASan build 38/38 with 0 findings. PR #22 opened: https://github.com/zarigata/RADS/pull/22
+
 - **2026-10-18**: (1) sync: fetch origin+fork green, PRs #19/#20 still open, none merged — cut
   `nightshift/20261018-re-named-groups` from `nightshift/20261017-forge-sync` head (freshest green);
   (2) `6ff4beb` feat(stdlib): **regex named groups** — `(?P<name>...)` + `(?<name>...)` lowered to POSIX ERE
@@ -63,14 +65,13 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 | PR | Title | Status | Verdict |
 |----|-------|--------|---------|
 | 20 | nostalgia module + clean-build fix for main | OPEN — head Dagoth-Ur-69:nightshift/20261017-forge-sync, +1 comment (pool_closed, bb7db17) | awaiting master review; carries the main clean-build fix |
-| 21 | regex named groups + replace heap-overflow fix | OPEN — head Dagoth-Ur-69:nightshift/20261018-re-named-groups | awaiting master review; top backlog parity item |
+| 21 | regex named groups + replace heap-overflow fix | OPEN — head Dagoth-Ur-69:nightshift/20261018-re-named-groups | awaiting master review |
+| 22 | datetime strptime/strftime Python-parity engine | OPEN — head Dagoth-Ur-69:nightshift/20261019-datetime-strptime | awaiting master review; strptime done, decimal/fractions next |
 
 ## Ranked Backlog (next shifts)
 1. **Merge stdlib branch** (unlocks clean builds of main) once auth exists; then CI should run
    `make clean && make` — never trust cached objects.
-2. Stdlib parity: `datetime.strptime` round-trip, `decimal`,
-   `fractions`, `itertools` lazy generators; TS parity: optional chaining `?.`, nullish `??`,
-   template literals, `Promise.allSettled`.
+2. Stdlib parity: `decimal`, `fractions`, `itertools` lazy generators; TS parity: optional chaining `?.`, nullish `??`, template literals, `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22).
 3. Sweep `-Wunused`/`-Wformat` warnings (rads-mask sprintf overflow is a real stack-smash risk).
 4. `.gitignore`: add `benchmarks/`, root symlinks (`rads`, `rads-mask`, `radpkg`),
    `tools/rads-mask/rads-mask` build binary.
