@@ -16,6 +16,7 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 **clean-build green** (trio 11+8+17 PASS, runner 9/9, exit 0). Merge that branch to unblock main.
 
 ## Night Log
+ - **2026-10-21**: (1) sync: fetch green, PRs #19-#22 still open, none merged, base unchanged; found ANOTHER corpse — night run died 04:20 with 1700 lines of uncommitted decimal C on branch nightshift/20261021-decimal (scratch probes p*/q*.rads all over the root). Recovered, deleted junk, finished the unit. (2) e0f9508 feat(stdlib): **decimal module, Python-parity arbitrary precision** — sign/scale limbs base 1e9, exact add/sub/mul, correctly-rounded long division (ROUND_HALF_EVEN, ctx 28 = CPython default), pow square-and-multiply (2**100 exact), sqrt integer Newton, CPython-exact str() (1E+25/1E-7/-0/0E+2 pins), NaN/Inf IEEE total order, spec floordiv/mod toward-zero, quantize half-even, normalize, struct {text,sign,digits,exponent}; 26 natives, tests/test_decimal.rads 40 assertions. (3) corpse bugs fixed: dec_num_digits NaN/Inf limbs[-1] segfault-on-parse, 5 leaks (pow/neg/abs/sqrt result, divmod coef run), dead norm_pow10, uninit digits early-oom, WRONG 1/3 pin (CPython says 28 threes — corpse wrote pin from memory without running python). (4) runner now 13 suites. Verified: clean build exit 0 / 0 warnings from decimal.c, 13/13 suites 0 FAIL lines, decimal 40/40, ASan 40/40 0 leaks. PR #23: https://github.com/zarigata/RADS/pull/23
 - **2026-10-20**: (1) sync: fetch origin+fork green, PRs #19/#20/#21 still open, none merged; found last nights run DEAD MID-FLIGHT (HTTP 429) with uncommitted strptime work on branch nightshift/20261019-datetime-strptime — recovered it, deleted junk placeholder file, finished the unit; (2) 4d7ed09 feat(stdlib): **datetime.strptime/strftime Python-parity engine** — full rewrite (+1000/-431): format->POSIX ERE lowered at cache time, CPython _strptime semantics (case-insensitive names, non-padded numbers, %I/%p 12h, %j julian, %U/%W weeks, %G-%V-%u ISO week dates, %z-aware epochs, 1900 default year, strict rejections: trailing garbage/Feb 30/hour 24/%G-without-%V -> null), strftime side exact Howard Hinnant civil math (no mktime/locale), composites %c/%x/%X/%F/%D/%T/%R/%r, glibc unknown-directive passthrough ("100%% %q" -> "100% %q"), legacy YYYY-MM-DD dialect kept; (3) bugs fixed en route: dt_unpack int-smash (month=0 -> MONTH_FULL[-1] segfault), format %% literal wrong output — the FAIL line was buried by the exit-code-only runner AGAIN (house grep law 3-for-3); (4) tests/test_datetime.rads 38 assertions wired into run_tests.sh (12 suites). Verified: clean build exit 0 (0 warnings from stdlib_datetime.c), 12/12 suites 0 FAIL lines, ASan build 38/38 with 0 findings. PR #22 opened: https://github.com/zarigata/RADS/pull/22
 
 - **2026-10-18**: (1) sync: fetch origin+fork green, PRs #19/#20 still open, none merged — cut
@@ -66,12 +67,13 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 |----|-------|--------|---------|
 | 20 | nostalgia module + clean-build fix for main | OPEN — head Dagoth-Ur-69:nightshift/20261017-forge-sync, +1 comment (pool_closed, bb7db17) | awaiting master review; carries the main clean-build fix |
 | 21 | regex named groups + replace heap-overflow fix | OPEN — head Dagoth-Ur-69:nightshift/20261018-re-named-groups | awaiting master review |
-| 22 | datetime strptime/strftime Python-parity engine | OPEN — head Dagoth-Ur-69:nightshift/20261019-datetime-strptime | awaiting master review; strptime done, decimal/fractions next |
+| 22 | datetime strptime/strftime Python-parity engine | OPEN — head Dagoth-Ur-69:nightshift/20261019-datetime-strptime | awaiting master review; strptime done |
+| 23 | decimal module, Python-parity arbitrary precision | OPEN — head Dagoth-Ur-69:nightshift/20261021-decimal | awaiting master review; decimal done, fractions next |
 
 ## Ranked Backlog (next shifts)
 1. **Merge stdlib branch** (unlocks clean builds of main) once auth exists; then CI should run
    `make clean && make` — never trust cached objects.
-2. Stdlib parity: `decimal`, `fractions`, `itertools` lazy generators; TS parity: optional chaining `?.`, nullish `??`, template literals, `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22).
+2. Stdlib parity: `fractions`, `itertools` lazy generators; TS parity: optional chaining `?.`, nullish `??`, template literals, `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22). ~~decimal~~ SHIPPED 2026-10-21 (PR #23).
 3. Sweep `-Wunused`/`-Wformat` warnings (rads-mask sprintf overflow is a real stack-smash risk).
 4. `.gitignore`: add `benchmarks/`, root symlinks (`rads`, `rads-mask`, `radpkg`),
    `tools/rads-mask/rads-mask` build binary.
