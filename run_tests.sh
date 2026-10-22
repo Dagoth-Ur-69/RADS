@@ -31,6 +31,7 @@ test_files=(
     "test_nostalgia.rads"
     "test_regex.rads"
     "test_datetime.rads"
+    "test_decimal.rads"
 )
 
 for test_file in "${test_files[@]}"; do

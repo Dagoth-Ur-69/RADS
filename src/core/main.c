@@ -24,6 +24,7 @@
 #include "stdlib_websocket.h"
 #include "stdlib_graphql.h"
 #include "stdlib_datetime.h"
+#include "stdlib_decimal.h"
 #include "stdlib_regex.h"
 #include "stdlib_test.h"
 #include "stdlib_env.h"
@@ -109,6 +110,7 @@ static void stdlib_register_all(void) {
     stdlib_db_register();
     stdlib_webengine_register();
     stdlib_datetime_register();
+    stdlib_decimal_register();
     stdlib_regex_register();
     stdlib_test_register();
     stdlib_env_register();
