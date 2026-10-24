@@ -33,6 +33,7 @@ test_files=(
     "test_datetime.rads"
     "test_decimal.rads"
     "test_fractions.rads"
+    "test_uaf_regression.rads"
 )
 
 for test_file in "${test_files[@]}"; do

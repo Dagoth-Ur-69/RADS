@@ -1657,26 +1657,39 @@ Value stdlib_decimal_precision(Interpreter* interp, int argc, Value* args) {
     return make_int(g_precision);
 }
 
-Value stdlib_decimal_min(Interpreter* interp, int argc, Value* args) {
-    (void)interp;
-    if (argc != 2) { fprintf(stderr, "Error: decimal.min(a, b) takes two arguments.\n"); return make_null(); }
-    Dec a, b;
-    if (!decimal_from_value(&args[0], &a, "min") || !decimal_from_value(&args[1], &b, "min")) return make_null();
+// Shared min/max core: compares then RE-BOXES the winner as a fresh decimal
+// value. Never return args[i] directly — the interpreter frees the args array
+// right after the native returns, so an aliased struct Value would leave the
+// caller holding a dangling text pointer (use-after-free; nested to_str used
+// to double-free/segfault). Mirrors fr_minmax in stdlib_fractions.c.
+static Value dec_minmax(Value* args, int argc, bool want_min) {
+    const char* name = want_min ? "min" : "max";
+    if (argc != 2) { fprintf(stderr, "Error: decimal.%s(a, b) takes two arguments.\n", name); return make_null(); }
+    Dec a, b, r;
+    memset(&r, 0, sizeof(Dec)); // dec_copy needs a clean slate to own its limbs
+    if (!decimal_from_value(&args[0], &a, name)) return make_null();
+    if (!decimal_from_value(&args[1], &b, name)) { dec_free(&a); return make_null(); }
     int c = dec_cmp(&a, &b);
+    bool ok = false;
+    if (c != -2) { // NaN is unordered (Python raises InvalidOperation)
+        bool take_a = want_min ? (c <= 0) : (c >= 0);
+        ok = dec_copy(&r, take_a ? &a : &b);
+    } else {
+        fprintf(stderr, "Error: decimal.%s with NaN is unordered.\n", name);
+    }
     dec_free(&a); dec_free(&b);
-    if (c == -2) { fprintf(stderr, "Error: decimal.min with NaN is unordered.\n"); return make_null(); }
-    return c <= 0 ? args[0] : args[1];
+    if (!ok) { dec_free(&r); return make_null(); }
+    Value v = decimal_to_value(&r);
+    dec_free(&r);
+    return v;
+}
+
+Value stdlib_decimal_min(Interpreter* interp, int argc, Value* args) {
+    (void)interp; return dec_minmax(args, argc, true);
 }
 
 Value stdlib_decimal_max(Interpreter* interp, int argc, Value* args) {
-    (void)interp;
-    if (argc != 2) { fprintf(stderr, "Error: decimal.max(a, b) takes two arguments.\n"); return make_null(); }
-    Dec a, b;
-    if (!decimal_from_value(&args[0], &a, "max") || !decimal_from_value(&args[1], &b, "max")) return make_null();
-    int c = dec_cmp(&a, &b);
-    dec_free(&a); dec_free(&b);
-    if (c == -2) { fprintf(stderr, "Error: decimal.max with NaN is unordered.\n"); return make_null(); }
-    return c >= 0 ? args[0] : args[1];
+    (void)interp; return dec_minmax(args, argc, false);
 }
 
 void stdlib_decimal_register(void) {

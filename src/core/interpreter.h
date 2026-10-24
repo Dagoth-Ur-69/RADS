@@ -99,6 +99,7 @@ Value make_string(const char* val);
 Value make_error(const char* msg); /* prints message, returns null */
 Value make_bool(bool val);
 Value make_null(void);
+Value value_retain(Value v); /* own-payload copy: survives caller value_free */
 Array* array_create(size_t capacity);
 void array_push(Array* arr, Value v);
 

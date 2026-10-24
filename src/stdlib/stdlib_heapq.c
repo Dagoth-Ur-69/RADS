@@ -118,7 +118,7 @@ Value stdlib_heapq_heappush(struct Interpreter* interp, int argc, Value* args) {
         fprintf(stderr, "Error: heapq.heappush: out of memory.\n");
         return make_null();
     }
-    a->items[a->count] = args[1]; /* slots move, no ownership change */
+    a->items[a->count] = value_retain(args[1]); /* args are freed by the caller after the native returns */
     sift_up(a->items, (int)a->count);
     a->count++;
     return make_null();
@@ -135,7 +135,7 @@ Value stdlib_heapq_heappop(struct Interpreter* interp, int argc, Value* args) {
         fprintf(stderr, "Error: heapq.heappop: heap is empty — nothing to pop.\n");
         return make_null();
     }
-    Value result = a->items[0];
+    Value result = a->items[0]; /* MOVE: root payload leaves the heap; slot overwritten by last item */
     a->items[0] = a->items[a->count - 1];
     a->count--;
     if (a->count > 1) sift_down(a->items, 0, (int)a->count - 1);
@@ -150,9 +150,9 @@ Value stdlib_heapq_heappushpop(struct Interpreter* interp, int argc, Value* args
     }
     Array* a = args[0].array_val;
     /* Fast path: new value can't beat the root */
-    if (a->count == 0 || cmp_values(args[1], a->items[0]) <= 0) return args[1];
-    Value result = a->items[0];
-    a->items[0] = args[1];
+    if (a->count == 0 || cmp_values(args[1], a->items[0]) <= 0) return value_retain(args[1]);
+    Value result = a->items[0]; /* MOVE: displaced root leaves the heap (slot overwritten) */
+    a->items[0] = value_retain(args[1]); /* CLONE into slot: interpreter frees args after the call */
     sift_down(a->items, 0, (int)a->count - 1);
     return result;
 }
@@ -168,8 +168,8 @@ Value stdlib_heapq_heapreplace(struct Interpreter* interp, int argc, Value* args
         fprintf(stderr, "Error: heapq.heapreplace: heap is empty — pop first, then push.\n");
         return make_null();
     }
-    Value result = a->items[0];
-    a->items[0] = args[1];
+    Value result = a->items[0]; /* MOVE: displaced root leaves the heap (slot overwritten) */
+    a->items[0] = value_retain(args[1]); /* CLONE into slot: interpreter frees args after the call */
     sift_down(a->items, 0, (int)a->count - 1);
     return result;
 }

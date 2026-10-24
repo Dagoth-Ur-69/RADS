@@ -243,6 +243,12 @@ void value_print(Value* value) {
 
 void value_free(Value* value) { value_release(value); }
 
+// Public wrapper so stdlib natives can safely return/alias arg memory:
+// the interpreter frees the args array right after a native call, so any
+// Value handed back must own its payload (strdup for strings, refcount++ for
+// arrays, deep-copy for struct instances). Never return args[i] raw.
+Value value_retain(Value v) { return value_clone(v); }
+
 // Environment (Variables)
 typedef struct Environment {
     char* name;
