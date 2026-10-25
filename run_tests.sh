@@ -34,6 +34,7 @@ test_files=(
     "test_decimal.rads"
     "test_fractions.rads"
     "test_uaf_regression.rads"
+    "test_itertools_lazy.rads"
 )
 
 for test_file in "${test_files[@]}"; do
