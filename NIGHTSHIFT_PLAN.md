@@ -17,6 +17,17 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 
 ## Night Log
 
+ - **2026-10-25**: (1) sync: fetch clean, PRs #19-#25 all still open, none merged, base unchanged; cut
+   nightshift/20261025-lazy-itertools from UAF-sweep head d9b3589. (2) 876c44d feat(stdlib): **first-class lazy iterators + Python-parity itertools** — new
+   VAL_ITERATOR core type (refcounted Iterator, pull-vtable next/cleanup, one-shot like Python gens, clone shares cursor like arrays); full itertools rewrite, 24 lazy
+   natives (count/cycle/repeat/chain/zip/zip_longest/enumerate/islice/takewhile/dropwhile/filter/filterfalse/map/starmap/accumulate/compress/pairwise/product/combinations/
+   permutations + iter/next/list/reduce), combinators nest as lazy pipelines, strings iterate UTF-8 code points, state Values owned via value_retain (UAF law). (3) DISCOVERED:
+   cruise (x in [1,2,3]) silently ran ZERO times on main — interpreter only handled the a..b range op; now drives arrays (snapshot count) + iterators (pull to exhaustion,
+   break/continue/return honored). (4) My own corpse bugs, caught by probes+ASan before shipping: pairwise never advanced its window; zip_longest emitted a phantom all-fill
+   row after both sources died; dropwhile fell into the takewhile branch after the drop phase (now TAKE/DROP/PASS mode machine); permutations seeded used[] past pool when r>n
+   (heap overflow, ASan-confirmed); islice cleanup never released its retained source (leak, LSan-confirmed). Also: ?. and ?? were ALREADY wired lexer->parser->interpreter —
+   backlog item was stale, marked done. (5) tests/test_itertools_lazy.rads 49 assertions (all python3.13-pinned), runner now 16 suites; old eager test_itertools.rads deleted.
+   Verified: clean build exit 0 (0 warnings from touched files), 16/16 suites 0 FAIL twice, ASan 49/49 0 findings 0 leaks twice. PR #26: https://github.com/zarigata/RADS/pull/26
  - **2026-10-24**: (1) sync: fetch clean, PRs #19-#24 all still open, none merged, base unchanged; cut
    nightshift/20261024-decimal-minmax-uaf from fractions head 8b5952c. (2) 159b937 fix(stdlib): **aliasing UAF
    sweep, 17 sites** — the decimal.min/max segfault was one instance of a repo-wide class: the interpreter frees the args
@@ -89,7 +100,7 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 ## Ranked Backlog (next shifts)
 1. **Merge stdlib branch** (unlocks clean builds of main) once auth exists; then CI should run
    `make clean && make` — never trust cached objects.
-2. Stdlib parity: `itertools` lazy generators; TS parity: optional chaining `?.`, nullish `??`, template literals, `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22). ~~decimal~~ SHIPPED 2026-10-21 (PR #23). ~~fractions~~ SHIPPED 2026-10-22 (PR #24).
+2. Stdlib parity: ~~`itertools` lazy generators~~ SHIPPED 2026-10-25 (PR #26). TS parity: ~~optional chaining `?.`~~ ~~nullish `??`~~ already wired in lexer/parser/interpreter (verified 2026-10-25) — remaining: template literals, `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22). ~~decimal~~ SHIPPED 2026-10-21 (PR #23). ~~fractions~~ SHIPPED 2026-10-22 (PR #24).
 3. **BUGHUNT (found 2026-10-22)**: `decimal.min`/`decimal.max` return `args[i]` as an aliased struct Value — use-after-free; nested `decimal.to_str(decimal.min("1", "2"))` SEGFAULTS on main today. Fix = re-box the winner like fractions does (see fr_minmax). Then: sweep `-Wunused`/`-Wformat` warnings (rads-mask sprintf overflow is a real stack-smash risk).
 4. `.gitignore`: add `benchmarks/`, root symlinks (`rads`, `rads-mask`, `radpkg`),
    `tools/rads-mask/rads-mask` build binary.
