@@ -355,6 +355,80 @@ static void env_free() {
     global_env = NULL;
 }
 
+/* env_remove — drop a binding created inside a finished call frame (param
+ * that had no caller binding). Why: without it, calling a function would
+ * permanently litter the global env with its parameter names. */
+static void env_remove(const char* name) {
+    Environment** link = &global_env;
+    while (*link) {
+        if (strcmp((*link)->name, name) == 0) {
+            Environment* dead = *link;
+            *link = dead->next;
+            free(dead->name);
+            value_free(&dead->value);
+            free(dead);
+            return;
+        }
+        link = &(*link)->next;
+    }
+
+}
+
+/* ===== Scoped call frames (nightshift 20261026) =====
+ * Why: parameters and locals bound to the single global environment leaked
+ *      into the caller's scope — worse, RECURSION was broken: an inner call
+ *      rebound the outer frame's n mid-expression (fib(10) returned -80).
+ *      Fix: each call pushes a frame of shadowed bindings; on return the
+ *      old values are restored. Locals still live in the global list (the
+ *      prototype's architecture), but a call can no longer vandalize the
+ *      caller's variables.
+ * Extend: replace with a real frame chain when closures arrive; the
+ *      save/restore protocol here is the migration seam. */
+
+typedef struct EnvShadow {
+    char* name;          /* variable name as written in env (owned) */
+    bool existed;        /* false = binding created by the callee, remove it */
+    Value saved;         /* the caller's value (owned clone) */
+    struct EnvShadow* next;
+} EnvShadow;
+
+/* frame_push_param — record the caller's binding for one param name before
+ * the callee overwrites it, so frame_pop can restore it later. */
+static void frame_push_param(EnvShadow** frame, const char* pname) {
+    EnvShadow* sh = malloc(sizeof(EnvShadow));
+    sh->name = strdup(pname);
+    Environment* binding = NULL;
+    for (Environment* cur = global_env; cur; cur = cur->next) {
+        if (strcmp(cur->name, pname) == 0) { binding = cur; break; }
+    }
+    if (binding) {
+        sh->existed = true;
+        sh->saved = value_clone(binding->value);
+    } else {
+        sh->existed = false;
+        sh->saved = make_null();
+    }
+    sh->next = *frame;
+    *frame = sh;
+}
+
+/* frame_pop — restore all shadowed bindings in reverse order (LIFO), so
+ * nested calls with the same param name unwind correctly. */
+static void frame_pop(EnvShadow* frame) {
+    while (frame) {
+        EnvShadow* next = frame->next;
+        if (frame->existed) {
+            env_set(frame->name, frame->saved);
+        } else {
+            env_remove(frame->name);
+        }
+        free(frame->name);
+        value_free(&frame->saved);
+        free(frame);
+        frame = next;
+    }
+}
+
 // Native function registry
 typedef struct NativeBinding {
     char* name;
@@ -632,6 +706,68 @@ static Value eval_unary_op(ASTNode* node) {
 }
 
 // Evaluate binary operation
+/* value_to_owned_string — convert any Value to a malloc'd string with the
+ * SAME semantics the + operator used (int %lld, float %g, bool true/false,
+ * string verbatim, arrays as [a, b, c], else "null"). Replaces the old
+ * 256-byte stack buffers in OP_ADD that silently clipped long values and
+ * could overrun on array joins — one dynamic home for the conversion now.
+ * Contract: caller owns the returned pointer; never NULL ("" on OOM). */
+static char* value_to_owned_string(Value v) {
+    switch (v.type) {
+        case VAL_STRING:
+            return strdup(v.string_val ? v.string_val : "");
+        case VAL_INT: {
+            int needed = snprintf(NULL, 0, "%lld", v.int_val);
+            char* out = malloc((size_t)needed + 1);
+            if (out) snprintf(out, (size_t)needed + 1, "%lld", v.int_val);
+            return out;
+        }
+        case VAL_FLOAT: {
+            int needed = snprintf(NULL, 0, "%g", v.float_val);
+            char* out = malloc((size_t)needed + 1);
+            if (out) snprintf(out, (size_t)needed + 1, "%g", v.float_val);
+            return out;
+        }
+        case VAL_BOOL:
+            return strdup(v.bool_val ? "true" : "false");
+        case VAL_NULL:
+            return strdup("null");
+        case VAL_ARRAY: {
+            if (!v.array_val) return strdup("[]");
+            /* sizing pass: sum worst-case renders + separator slack */
+            size_t cap = 8;
+            for (size_t i = 0; i < v.array_val->count; i++) {
+                Value* item = &v.array_val->items[i];
+                if (item->type == VAL_STRING && item->string_val)
+                    cap += strlen(item->string_val);
+                else if (item->type == VAL_ARRAY || item->type == VAL_STRUCT_INSTANCE)
+                    cap += 64;
+                else
+                    cap += 32;
+                cap += 4;
+            }
+            char* out = malloc(cap);
+            if (!out) return strdup("[]");
+            size_t pos = 0;
+            out[pos++] = '[';
+            for (size_t i = 0; i < v.array_val->count; i++) {
+                if (i > 0) { out[pos++] = ','; out[pos++] = ' '; }
+                char* item = value_to_owned_string(v.array_val->items[i]);
+                size_t ilen = item ? strlen(item) : 0;
+                if (pos + ilen + 2 > cap) ilen = cap - pos - 2; /* belt+braces */
+                memcpy(out + pos, item, ilen);
+                pos += ilen;
+                free(item);
+            }
+            out[pos++] = ']';
+            out[pos] = '\0';
+            return out;
+        }
+        default:
+            return strdup("null");
+    }
+}
+
 static Value eval_binary_op(ASTNode* node) {
     Value left = eval_expression(node->binary_op.left);
     Value right = eval_expression(node->binary_op.right);
@@ -645,105 +781,24 @@ static Value eval_binary_op(ASTNode* node) {
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_float(left.float_val + right.float_val);
             } else if (left.type == VAL_STRING || right.type == VAL_STRING) {
-                // String concatenation with automatic conversion
-                char left_buf[256] = "";
-                char right_buf[256] = "";
-                const char* left_str = left_buf;
-                const char* right_str = right_buf;
-
-                // Convert left to string
-                if (left.type == VAL_STRING) {
-                    left_str = left.string_val;
-                } else if (left.type == VAL_INT) {
-                    snprintf(left_buf, sizeof(left_buf), "%lld", left.int_val);
-                } else if (left.type == VAL_FLOAT) {
-                    snprintf(left_buf, sizeof(left_buf), "%g", left.float_val);
-                } else if (left.type == VAL_BOOL) {
-                    snprintf(left_buf, sizeof(left_buf), "%s", left.bool_val ? "true" : "false");
-                } else if (left.type == VAL_ARRAY) {
-                    // Convert array to string representation
-                    if (left.array_val) {
-                        char* arr_str = malloc(1024);
-                        strcpy(arr_str, "[");
-                        for (size_t i = 0; i < left.array_val->count && strlen(arr_str) < 1000; i++) {
-                            if (i > 0) strcat(arr_str, ", ");
-                            Value* item = &left.array_val->items[i];
-                            char item_buf[64];
-                            if (item->type == VAL_INT) {
-                                snprintf(item_buf, sizeof(item_buf), "%lld", item->int_val);
-                            } else if (item->type == VAL_FLOAT) {
-                                snprintf(item_buf, sizeof(item_buf), "%g", item->float_val);
-                            } else if (item->type == VAL_STRING) {
-                                snprintf(item_buf, sizeof(item_buf), "%s", item->string_val);
-                            } else if (item->type == VAL_BOOL) {
-                                strcpy(item_buf, item->bool_val ? "true" : "false");
-                            } else {
-                                strcpy(item_buf, "null");
-                            }
-                            strcat(arr_str, item_buf);
-                        }
-                        strcat(arr_str, "]");
-                        left_str = left_buf;
-                        strncpy(left_buf, arr_str, sizeof(left_buf) - 1);
-                        left_buf[sizeof(left_buf) - 1] = '\0';
-                        free(arr_str);
-                    } else {
-                        strcpy(left_buf, "[]");
+                /* String concatenation with automatic conversion — dynamic and
+                 * overflow-proof (the old 256-byte stack buffers clipped long
+                 * values; template literals made this path hot, so it must be
+                 * correct for any length). */
+                char* ls = value_to_owned_string(left);
+                char* rs = value_to_owned_string(right);
+                if (ls && rs) {
+                    size_t len = strlen(ls) + strlen(rs) + 1;
+                    char* str = malloc(len);
+                    if (str) {
+                        strcpy(str, ls);
+                        strcat(str, rs);
+                        result = make_string(str);
+                        free(str);
                     }
-                } else {
-                    strcpy(left_buf, "null");
                 }
-
-                // Convert right to string
-                if (right.type == VAL_STRING) {
-                    right_str = right.string_val;
-                } else if (right.type == VAL_INT) {
-                    snprintf(right_buf, sizeof(right_buf), "%lld", right.int_val);
-                } else if (right.type == VAL_FLOAT) {
-                    snprintf(right_buf, sizeof(right_buf), "%g", right.float_val);
-                } else if (right.type == VAL_BOOL) {
-                    snprintf(right_buf, sizeof(right_buf), "%s", right.bool_val ? "true" : "false");
-                } else if (right.type == VAL_ARRAY) {
-                    // Convert array to string representation
-                    if (right.array_val) {
-                        char* arr_str = malloc(1024);
-                        strcpy(arr_str, "[");
-                        for (size_t i = 0; i < right.array_val->count && strlen(arr_str) < 1000; i++) {
-                            if (i > 0) strcat(arr_str, ", ");
-                            Value* item = &right.array_val->items[i];
-                            char item_buf[64];
-                            if (item->type == VAL_INT) {
-                                snprintf(item_buf, sizeof(item_buf), "%lld", item->int_val);
-                            } else if (item->type == VAL_FLOAT) {
-                                snprintf(item_buf, sizeof(item_buf), "%g", item->float_val);
-                            } else if (item->type == VAL_STRING) {
-                                snprintf(item_buf, sizeof(item_buf), "%s", item->string_val);
-                            } else if (item->type == VAL_BOOL) {
-                                strcpy(item_buf, item->bool_val ? "true" : "false");
-                            } else {
-                                strcpy(item_buf, "null");
-                            }
-                            strcat(arr_str, item_buf);
-                        }
-                        strcat(arr_str, "]");
-                        right_str = right_buf;
-                        strncpy(right_buf, arr_str, sizeof(right_buf) - 1);
-                        right_buf[sizeof(right_buf) - 1] = '\0';
-                        free(arr_str);
-                    } else {
-                        strcpy(right_buf, "[]");
-                    }
-                } else {
-                    strcpy(right_buf, "null");
-                }
-
-                // Concatenate
-                size_t len = strlen(left_str) + strlen(right_str) + 1;
-                char* str = malloc(len);
-                strcpy(str, left_str);
-                strcat(str, right_str);
-                result = make_string(str);
-                free(str);
+                free(ls);
+                free(rs);
             }
             break;
         case OP_RANGE:
@@ -1516,14 +1571,18 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
     }
 
     ASTNode* func = callback.func_node;
-    // Bind parameters naively to globals for now
+    /* Scoped call frames (nightshift 20261026): save each param's caller
+     * binding, bind for the callee, restore on exit — fixes param leakage
+     * into the caller AND makes recursion correct (inner calls no longer
+     * clobber the outer frame's bindings mid-expression). */
+    EnvShadow* frame = NULL;
     if (func->function_decl.parameters) {
         int param_count = (int)func->function_decl.parameters->count;
         for (int i = 0; i < param_count; i++) {
             ASTNode* param_node = func->function_decl.parameters->nodes[i];
             const char* pname;
             Value arg;
-            
+
             if (param_node->type == AST_VARIABLE_DECL) {
                 pname = param_node->variable_decl.name;
                 if (i < argc && args) {
@@ -1537,11 +1596,13 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
                 pname = param_node->identifier.name;
                 arg = (i < argc && args) ? value_clone(args[i]) : make_null();
             }
+            frame_push_param(&frame, pname);
             env_set(pname, arg);
             value_free(&arg);
         }
     }
     ExecResult r = exec_statement(func->function_decl.body);
+    frame_pop(frame);
     if (r == EXEC_RETURN && has_return_value) {
         Value rv = value_clone(current_return_value);
         value_free(&current_return_value);
