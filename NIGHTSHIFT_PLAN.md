@@ -17,6 +17,19 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 
 ## Night Log
 
+ - **2026-10-26**: (1) sync: fetch clean, PRs #19-#26 all still open, none merged, base unchanged; cut
+   nightshift/20261026-template-literals from lazy-itertools head 8eeb1c2. (2) d834d54 fix(core): **scoped call frames — recursion was BROKEN on main**. Params bound to the
+   single global env, so (a) calls permanently rebound same-named caller vars (g(name) rewrote main's name — found because template tests were position-dependent), and (b) inner
+   calls clobbered outer bindings mid-expression: fib(10) returned -80, not 55 (verified on base with a probe). Fix: EnvShadow frame per call (save caller binding, bind, LIFO
+   restore on exit) + env_remove() for params with no prior binding. fib(10)=55, leak gone, ASan clean incl. leaks. (3) bbe21bb feat(core): **template literals, TS-parity** —
+   backtick templates with ${...} interpolation; lexer emits START/CHUNK/EXPR_BEGIN/EXPR_END/END via a frame stack (nested templates inside ${}, brace counting so struct literals
+   in holes don't close early, raw-text law kept: NO unescaping, multi-line text, unterminated diagnostic); parser lowers to left-fold of + seeded with "" so `${7}`=="7"; interpreter
+   value_to_owned_string() — dynamic heap conversion replacing OP_ADD's 256-byte stack buffers that silently clipped long concatenations (latent bug, killed). (4) House lesson
+   re-learned: make has NO header deps — editing lexer.h (struct layout) without make clean = segfaults from stale objects; burned 20 min on a ghost crash. (5) Known pre-existing
+   debt confirmed: struct-literal AST leaks 84B/4alloc (same class as test_structs, in backlog); fn-local `turbo` decls still bind globally (e2 probe prints 1 not 2) — frames fix
+   params only, full scope chain is future work. tests/test_template_literals.rads 21 assertions (node v20.19.2-pinned), runner now 17 suites. Verified: clean build exit 0 (0
+   warnings from touched files), 17/17 suites 0 FAIL twice, ASan 21/21 twice + 0 runtime findings. PR #27: https://github.com/zarigata/RADS/pull/27
+
  - **2026-10-25**: (1) sync: fetch clean, PRs #19-#25 all still open, none merged, base unchanged; cut
    nightshift/20261025-lazy-itertools from UAF-sweep head d9b3589. (2) 876c44d feat(stdlib): **first-class lazy iterators + Python-parity itertools** — new
    VAL_ITERATOR core type (refcounted Iterator, pull-vtable next/cleanup, one-shot like Python gens, clone shares cursor like arrays); full itertools rewrite, 24 lazy
@@ -95,13 +108,19 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 | 21 | regex named groups + replace heap-overflow fix | OPEN — head Dagoth-Ur-69:nightshift/20261018-re-named-groups | awaiting master review |
 | 22 | datetime strptime/strftime Python-parity engine | OPEN — head Dagoth-Ur-69:nightshift/20261019-datetime-strptime | awaiting master review; strptime done |
 | 24 | fractions module, Python-parity exact rationals | OPEN — head Dagoth-Ur-69:nightshift/20261022-fractions | awaiting master review; fractions done, lazy itertools next |
+| 27 | template literals + scoped call frames (recursion fix) | OPEN — head Dagoth-Ur-69:nightshift/20261026-template-literals | awaiting master review; fib(10) was -80 on main, now 55 |
 | 23 | decimal module, Python-parity arbitrary precision | OPEN — head Dagoth-Ur-69:nightshift/20261021-decimal | awaiting master review; decimal done, fractions next |
 
 ## Ranked Backlog (next shifts)
 1. **Merge stdlib branch** (unlocks clean builds of main) once auth exists; then CI should run
    `make clean && make` — never trust cached objects.
-2. Stdlib parity: ~~`itertools` lazy generators~~ SHIPPED 2026-10-25 (PR #26). TS parity: ~~optional chaining `?.`~~ ~~nullish `??`~~ already wired in lexer/parser/interpreter (verified 2026-10-25) — remaining: template literals, `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22). ~~decimal~~ SHIPPED 2026-10-21 (PR #23). ~~fractions~~ SHIPPED 2026-10-22 (PR #24).
-3. **BUGHUNT (found 2026-10-22)**: `decimal.min`/`decimal.max` return `args[i]` as an aliased struct Value — use-after-free; nested `decimal.to_str(decimal.min("1", "2"))` SEGFAULTS on main today. Fix = re-box the winner like fractions does (see fr_minmax). Then: sweep `-Wunused`/`-Wformat` warnings (rads-mask sprintf overflow is a real stack-smash risk).
+2. Stdlib parity: ~~`itertools` lazy generators~~ SHIPPED 2026-10-25 (PR #26). TS parity: ~~optional chaining `?.`~~ ~~nullish `??`~~ already wired (verified 2026-10-25).
+   ~~template literals~~ SHIPPED 2026-10-26 (PR #27, with recursion fix). Remaining: `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22). ~~decimal~~ SHIPPED
+   2026-10-21 (PR #23). ~~fractions~~ SHIPPED 2026-10-22 (PR #24).
+3. **BUGHUNT backlog**: (a) fn-LOCAL `turbo` decls still bind globally (frame fix 2026-10-26 covers PARAMS only; e2 probe: local=1 leaks into caller) — needs a real scope chain
+   when closures arrive. (b) struct-literal AST leak debt: 84B/4alloc per struct literal eval (ast_create_identifier via parse_primary; same class as test_structs LSan findings).
+   (c) sweep `-Wunused`/`-Wformat` warnings (rads-mask sprintf overflow is a real stack-smash risk). (d) Makefile has NO header deps — editing any .h demands `make clean` or
+   stale objects segfault (cost 20 min on 2026-10-26); add -MMD -MP autodeps.
 4. `.gitignore`: add `benchmarks/`, root symlinks (`rads`, `rads-mask`, `radpkg`),
    `tools/rads-mask/rads-mask` build binary.
 5. v0_0_7_comprehensive.rads still absent from run_tests.sh array (exists in tests/, 155-line diff
