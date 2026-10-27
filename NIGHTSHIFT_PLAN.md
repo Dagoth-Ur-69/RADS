@@ -16,6 +16,10 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 **clean-build green** (trio 11+8+17 PASS, runner 9/9, exit 0). Merge that branch to unblock main.
 
 ## Night Log
+ 
+ - **2026-10-27**: (1) sync: fetch clean, PRs #19-#27 all still open, none merged, base unchanged; cut nightshift/20261027-promise-allsettled from template-literals head c2250c6. (2) da17110 fix(core): **exception propagation was BROKEN across call boundaries** — try { boom() } catch NEVER caught (callback left the throw pending, eval_call returned null), uncaught throws exited 0 silently, and the REPL would have been poisoned by a stale pending flag. Now: pending throw unwinds at block/statement level (try/finally exempt), finally runs during unwind with TS replace-on-throw semantics (my first cut restored the ORIGINAL exception over a finally-thrown one — backwards, fixed), uncaught -> 'Uncaught error: X' + exit 1 (Python/Node parity), REPL reports per-line. Same commit killed two more pre-existing segfaults, both found by probes on base: (a) anonymous struct instances (NULL definition — EVERY regex.search result!) crashed on missing-field access AND on echo() (NULL->definition->name deref); (b) array-index eval shallow-copied struct items then freed the source array — turbo p = arr[0] handed back freed memory (same UAF class as the 20261024 sweep, index path missed). Plus catch-var parser leak (strdup'd twice). Core gained public interpreter_has_throw()/take_throw()/raise(). (3) ebf17f0 feat(stdlib): **Promise.allSettled/all/race/any — the LAST TS-parity backlog item**. No microtask queue exists, so combinators settle synchronously; semantics preserved: allSettled never rejects ({status,value|reason} per input, input order), all re-raises first rejection, race first settlement, any first fulfillment else AggregateError {name,message,errors}. Rejections modelled as throw-in-body exactly like TS — only possible because of the barrier fix. Pins from real Node v20.19.2. tests/test_promise.rads 18 assertions, runner 18 suites. LSan caught TWO leaks in my own first cut (promise_any errors-array refcount, exposed parser catch-var) — both fixed, 0 leaks now. (4) House lesson x2: 'git add src/core/x.c' trips the 'core' gitignore pattern (bare-dir match) — use -f; make CFLAGS=... sanitizer build leaves stale ASan objects that break the NEXT plain make link (no header deps, again — backlog 3(d) bites). Verified: clean build exit 0 (0 warnings from touched files), 18/18 suites 0 FAIL twice, ASan 18/18 0 findings 0 leaks on new suite, uaf/itertools suites clean under ASan too. PR #28: https://github.com/zarigata/RADS/pull/28
+ 
+
 
  - **2026-10-26**: (1) sync: fetch clean, PRs #19-#26 all still open, none merged, base unchanged; cut
    nightshift/20261026-template-literals from lazy-itertools head 8eeb1c2. (2) d834d54 fix(core): **scoped call frames — recursion was BROKEN on main**. Params bound to the
@@ -108,13 +112,14 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 | 21 | regex named groups + replace heap-overflow fix | OPEN — head Dagoth-Ur-69:nightshift/20261018-re-named-groups | awaiting master review |
 | 22 | datetime strptime/strftime Python-parity engine | OPEN — head Dagoth-Ur-69:nightshift/20261019-datetime-strptime | awaiting master review; strptime done |
 | 24 | fractions module, Python-parity exact rationals | OPEN — head Dagoth-Ur-69:nightshift/20261022-fractions | awaiting master review; fractions done, lazy itertools next |
-| 27 | template literals + scoped call frames (recursion fix) | OPEN — head Dagoth-Ur-69:nightshift/20261026-template-literals | awaiting master review; fib(10) was -80 on main, now 55 |
+| 27 | template literals + scoped call frames (recursion fix) | OPEN — head Dagoth-Ur-69:nightshift/20261026-template-literals | awaiting master review; fib(10) was -80 on main, now 55 | 
+| 28 | Promise combinators + exception propagation fix | OPEN — head Dagoth-Ur-69:nightshift/20261027-promise-allsettled | awaiting master review; try/catch across calls + regex.search structs were broken on main |
 | 23 | decimal module, Python-parity arbitrary precision | OPEN — head Dagoth-Ur-69:nightshift/20261021-decimal | awaiting master review; decimal done, fractions next |
 
 ## Ranked Backlog (next shifts)
 1. **Merge stdlib branch** (unlocks clean builds of main) once auth exists; then CI should run
    `make clean && make` — never trust cached objects.
-2. Stdlib parity: ~~`itertools` lazy generators~~ SHIPPED 2026-10-25 (PR #26). TS parity: ~~optional chaining `?.`~~ ~~nullish `??`~~ already wired (verified 2026-10-25).
+2. Stdlib parity: ~~itertools lazy generators~~ SHIPPED 2026-10-25 (PR #26). TS parity: ~~optional chaining ?.~~ ~~nullish ??~~ already wired (verified 2026-10-25). TS PARITY TRACK COMPLETE 2026-10-27: template literals PR #27, Promise.allSettled (+all/race/any, + throw-barrier core fix) PR #28.
    ~~template literals~~ SHIPPED 2026-10-26 (PR #27, with recursion fix). Remaining: `Promise.allSettled`. ~~datetime.strptime~~ SHIPPED 2026-10-20 (PR #22). ~~decimal~~ SHIPPED
    2026-10-21 (PR #23). ~~fractions~~ SHIPPED 2026-10-22 (PR #24).
 3. **BUGHUNT backlog**: (a) fn-LOCAL `turbo` decls still bind globally (frame fix 2026-10-26 covers PARAMS only; e2 probe: local=1 leaks into caller) — needs a real scope chain
