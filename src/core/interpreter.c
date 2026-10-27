@@ -252,7 +252,13 @@ void value_print(Value* value) {
             printf("<struct def %s>", value->struct_def->name);
             break;
         case VAL_STRUCT_INSTANCE:
-            printf("<struct instance %s>", value->struct_instance->definition->name);
+            /* Anonymous instances (built by natives like regex.search) carry a
+             * NULL definition — printing must not dereference it. */
+            if (value->struct_instance->definition) {
+                printf("<struct instance %s>", value->struct_instance->definition->name);
+            } else {
+                printf("<struct instance>");
+            }
             break;
     }
 }
@@ -968,18 +974,14 @@ static Value eval_expression(ASTNode* node) {
             Value result = make_null();
             if (arr.type == VAL_ARRAY && idx.type == VAL_INT) {
                 if (idx.int_val >= 0 && (size_t)idx.int_val < arr.array_val->count) {
-                    // return copy
-                    Value elem = arr.array_val->items[idx.int_val];
-                    // shallow copy ok; duplicate strings
-                    if (elem.type == VAL_STRING) {
-                        result = make_string(elem.string_val);
-                    } else if (elem.type == VAL_ARRAY) {
-                        // simplistic: not deep copy; share
-                        result.type = VAL_ARRAY;
-                        result.array_val = elem.array_val;
-                    } else {
-                        result = elem;
-                    }
+                    /* UAF fix (nightshift 20261027): the old code shallow-copied
+                     * struct instances (and ignored iterator refcounts) and then
+                     * value_free(&arr) below released the array, freeing the very
+                     * struct this result points at — `turbo p = arr[0]; p.x`
+                     * segfaulted. value_clone does the right thing for every
+                     * type: strdup strings, refcount++ arrays/iterators, deep
+                     * copy struct instances, trivial copy scalars. */
+                    result = value_clone(arr.array_val->items[idx.int_val]);
                 }
             }
             value_free(&arr);
@@ -1046,7 +1048,9 @@ static Value eval_expression(ASTNode* node) {
                     }
                     current = current->next;
                 }
-                fprintf(stderr, "Error: Struct '%s' has no member '%s'.\n", object.struct_instance->definition->name, member_name);
+                const char* sname = object.struct_instance->definition
+                                      ? object.struct_instance->definition->name : "<anonymous>";
+                fprintf(stderr, "Error: Struct '%s' has no member '%s'.\n", sname, member_name);
             } else if (object.type == VAL_ARRAY) {
                 const char* member_name = node->member_expr.member;
                 if (strcmp(member_name, "length") == 0) {
@@ -1243,7 +1247,15 @@ static bool is_truthy(Value v) {
 // Execute statement
 static ExecResult exec_statement(ASTNode* node) {
     if (!node) return EXEC_OK;
-    
+
+    /* Throw barrier: an exception in flight from a previous statement (e.g. a
+     * bare call to a throwing function) unwinds from the next statement on.
+     * Try statements are exempt — their block handles entry with pending state
+     * by catching it, which keeps `boom(); try {...} catch` coherent. */
+    if (has_thrown_value && node->type != AST_TRY_STMT) {
+        return EXEC_THROW;
+    }
+
     switch (node->type) {
         case AST_STRUCT_DECL:
             register_struct(node->struct_decl.name, node);
@@ -1305,6 +1317,12 @@ static ExecResult exec_statement(ASTNode* node) {
                 ExecResult r = exec_statement(node->block.statements->nodes[i]);
                 if (r == EXEC_BREAK || r == EXEC_CONTINUE || r == EXEC_RETURN || r == EXEC_THROW) {
                     return r;
+                }
+                /* Throw barrier (nightshift 20261027): a callee's throw leaves
+                 * pending state even when the call expression itself returned
+                 * EXEC_OK — unwind here so enclosing try/catch can see it. */
+                if (has_thrown_value) {
+                    return EXEC_THROW;
                 }
             }
             return EXEC_OK;
@@ -1456,7 +1474,24 @@ static ExecResult exec_statement(ASTNode* node) {
             }
             
             if (node->try_stmt.finally_block) {
+                /* Park an in-flight throw so the finally body actually runs
+                 * (the statement-level barrier would skip it otherwise). */
+                bool parked_pending = has_thrown_value;
+                Value parked_value = thrown_value;
+                if (parked_pending) {
+                    has_thrown_value = false;
+                }
                 ExecResult fr = exec_statement(node->try_stmt.finally_block);
+                if (parked_pending) {
+                    if (has_thrown_value) {
+                        /* TS semantics: a throw from finally REPLACES the
+                         * in-flight exception — the newer one wins. */
+                        value_free(&parked_value);
+                    } else {
+                        thrown_value = parked_value;
+                        has_thrown_value = true;
+                    }
+                }
                 if (fr == EXEC_RETURN) {
                     return EXEC_RETURN;
                 }
@@ -1612,6 +1647,51 @@ Value interpreter_execute_callback(Value callback, int argc, Value* args) {
     return make_null();
 }
 
+/* Report an exception that reached the top of the program without a
+ * matching catch — Python/TS parity: message on stderr, nonzero exit. */
+static void report_uncaught_throw(void) {
+    fprintf(stderr, "Uncaught");
+    switch (thrown_value.type) {
+        case VAL_STRING: fprintf(stderr, " error: %s", thrown_value.string_val); break;
+        case VAL_INT:    fprintf(stderr, " error: %lld", thrown_value.int_val); break;
+        case VAL_FLOAT:  fprintf(stderr, " error: %f", thrown_value.float_val); break;
+        case VAL_BOOL:   fprintf(stderr, " error: %s", thrown_value.bool_val ? "true" : "false"); break;
+        default:         fprintf(stderr, " error: <value>"); break;
+    }
+    fprintf(stderr, "\n");
+    value_free(&thrown_value);
+    has_thrown_value = false;
+}
+
+/* Peek: is an exception currently in flight? (Promise natives need to
+ * distinguish "nothing thrown" from "null was thrown" before taking.) */
+bool interpreter_has_throw(void) {
+    return has_thrown_value;
+}
+
+/* Take ownership of a pending throw (if any): returns a clone of the thrown
+ * value and clears the pending state. Natives like Promise.allSettled use
+ * this to convert a callback's throw into a rejection record. */
+Value interpreter_take_throw(void) {
+    if (!has_thrown_value) {
+        return make_null();
+    }
+    Value out = value_clone(thrown_value);
+    value_free(&thrown_value);
+    has_thrown_value = false;
+    return out;
+}
+
+/* Raise a value as an in-flight exception from native code (e.g. Promise.all
+ * re-raising the first rejection so the caller's try/catch sees it). */
+void interpreter_raise(Value v) {
+    if (has_thrown_value) {
+        value_free(&thrown_value);
+    }
+    thrown_value = value_clone(v);
+    has_thrown_value = true;
+}
+
 // Main interpreter
 int interpret(ASTNode* program) {
     if (!program || program->type != AST_PROGRAM) {
@@ -1646,6 +1726,12 @@ int interpret(ASTNode* program) {
     if (main_val.type == VAL_FUNCTION) {
         exec_statement(main_val.func_node->function_decl.body);
         value_free(&main_val);
+        if (has_thrown_value) {
+            report_uncaught_throw();
+            env_free();
+            interpreter_cleanup_event_loop();
+            return 1; /* Python/Node parity: uncaught exception -> nonzero exit */
+        }
     } else {
         // Fallback: search declarations (legacy)
         for (size_t i = 0; i < program->program.declarations->count; i++) {
@@ -1672,6 +1758,11 @@ int interpret_repl_statement(ASTNode* stmt) {
     // Execute the statement directly
     // Environment persists across calls for REPL
     exec_statement(stmt);
+    /* A throw the user never caught must not poison the next REPL line —
+     * report it and clear, the way Python/Node REPLs do. */
+    if (has_thrown_value) {
+        report_uncaught_throw();
+    }
     return 0;
 }
 

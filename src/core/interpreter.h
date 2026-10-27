@@ -113,6 +113,9 @@ void interpreter_cleanup_event_loop(void);
 void interpreter_cleanup_environment(void);
 void interpreter_run_event_loop(void);
 Value interpreter_execute_callback(Value callback, int argc, Value* args);
+bool interpreter_has_throw(void);    /* is an exception in flight? */
+Value interpreter_take_throw(void);   /* consume pending throw: clone-or-null, clears flag */
+void interpreter_raise(Value v);      /* install v as the in-flight exception */
 
 Value make_int(long long val);
 Value make_float(double val);

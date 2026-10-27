@@ -1242,7 +1242,11 @@ ASTNode* parse_statement(Parser* parser) {
             finally_block = parse_block(parser);
         }
         
-        return ast_create_try(try_block, catch_var, catch_block, finally_block, line, column);
+        /* ast_create_try strdups catch_var — free the parser-local copy
+         * (nightshift 20261027 leak fix; LSan caught it via test_promise). */
+        ASTNode* try_node = ast_create_try(try_block, catch_var, catch_block, finally_block, line, column);
+        free(catch_var);
+        return try_node;
     }
     
     if (match(parser, TOKEN_THROW)) {
