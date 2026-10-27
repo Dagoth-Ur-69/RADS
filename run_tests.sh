@@ -36,6 +36,7 @@ test_files=(
     "test_uaf_regression.rads"
     "test_itertools_lazy.rads"
     "test_template_literals.rads"
+    "test_promise.rads"
 )
 
 for test_file in "${test_files[@]}"; do

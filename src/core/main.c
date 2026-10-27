@@ -21,6 +21,7 @@
 #include "stdlib_db.h"
 #include "stdlib_webengine.h"
 #include "stdlib_async_utils.h"
+#include "stdlib_promise.h"
 #include "stdlib_websocket.h"
 #include "stdlib_graphql.h"
 #include "stdlib_datetime.h"
@@ -126,6 +127,7 @@ static void stdlib_register_all(void) {
     stdlib_sort_register();
     stdlib_http_register();
     stdlib_async_utils_register();
+    stdlib_promise_register();
     stdlib_websocket_register();
     stdlib_graphql_register();
     stdlib_os_register();
