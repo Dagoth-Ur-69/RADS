@@ -188,6 +188,7 @@ ASTNode* parse_statement(Parser* parser);  // Public for REPL
 static ASTNode* parse_declaration(Parser* parser);
 static ASTNode* parse_comparison(Parser* parser);
 static ASTNode* parse_block(Parser* parser);
+static void synchronize(Parser* parser);
 
 /* str_dup_range — malloc'd NUL-terminated copy of [from, from+len).
  * Why: template chunks arrive as raw spans; the AST owns its strings, so
@@ -363,12 +364,21 @@ static ASTNode* parse_primary(Parser* parser) {
     }
     
     error(parser, "Expected expression");
+    /* Panic-mode progress law: the offending token must be consumed or every
+     * enclosing loop re-reports the identical error forever. */
+    if (!check(parser, TOKEN_EOF)) {
+        advance(parser);
+    }
     return NULL;
 }
 
 // Parse call expressions
 static ASTNode* parse_call(Parser* parser) {
     ASTNode* expr = parse_primary(parser);
+    
+    /* parse_primary returns NULL after an error (and has consumed the bad
+     * token); cascading callers must stop instead of dereferencing NULL. */
+    if (!expr) return NULL;
     
     while (true) {
         if (match(parser, TOKEN_LEFT_BRACE)) { // Struct literal
@@ -740,7 +750,15 @@ static ASTNode* parse_block(Parser* parser) {
     
     while (!check(parser, TOKEN_RIGHT_BRACE) && !check(parser, TOKEN_EOF)) {
         ASTNode* stmt = parse_statement(parser);
-        if (stmt) ast_list_append(statements, stmt);
+        if (stmt) {
+            ast_list_append(statements, stmt);
+        } else if (parser->panic_mode) {
+            /* Statement failed without producing a node. Without this guard
+             * the loop re-parsed the SAME unconsumed token forever (an
+             * 'else' at statement position produced 158MB of errors).
+             * synchronize() skips to the next statement boundary. */
+            synchronize(parser);
+        }
     }
     
     consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after block");
@@ -1284,7 +1302,15 @@ static void synchronize(Parser* parser) {
     parser->panic_mode = false;
 
     while (parser->current.type != TOKEN_EOF) {
-        // Semicolon marks end of statement
+        /* Semicolon marks end of statement. It must be CONSUMED to guarantee
+         * forward progress: an unconsumed ';' as current (e.g. after
+         * "Expected ';' after expression" on the same token) used to loop
+         * the same error forever. */
+        if (parser->current.type == TOKEN_SEMICOLON) {
+            advance(parser);
+            return;
+        }
+
         if (parser->previous.type == TOKEN_SEMICOLON) return;
 
         // Right brace at top level (end of block/struct) - advance past it
