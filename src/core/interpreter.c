@@ -786,6 +786,10 @@ static Value eval_binary_op(ASTNode* node) {
                 result = make_int(left.int_val + right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_float(left.float_val + right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_float((double)left.int_val + right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_float(left.float_val + (double)right.int_val);
             } else if (left.type == VAL_STRING || right.type == VAL_STRING) {
                 /* String concatenation with automatic conversion — dynamic and
                  * overflow-proof (the old 256-byte stack buffers clipped long
@@ -879,6 +883,10 @@ static Value eval_binary_op(ASTNode* node) {
                 result = make_bool(left.int_val == right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val == right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val == right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val == (double)right.int_val);
             } else if (left.type == VAL_BOOL && right.type == VAL_BOOL) {
                 result = make_bool(left.bool_val == right.bool_val);
             } else if (left.type == VAL_STRING && right.type == VAL_STRING) {
@@ -894,6 +902,10 @@ static Value eval_binary_op(ASTNode* node) {
                 result = make_bool(left.int_val != right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val != right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val != right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val != (double)right.int_val);
             } else if (left.type == VAL_BOOL && right.type == VAL_BOOL) {
                 result = make_bool(left.bool_val != right.bool_val);
             } else if (left.type == VAL_STRING && right.type == VAL_STRING) {
@@ -909,6 +921,10 @@ static Value eval_binary_op(ASTNode* node) {
                 result = make_bool(left.int_val < right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val < right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val < right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val < (double)right.int_val);
             }
             break;
         case OP_LTE:
@@ -916,6 +932,10 @@ static Value eval_binary_op(ASTNode* node) {
                 result = make_bool(left.int_val <= right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val <= right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val <= right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val <= (double)right.int_val);
             }
             break;
         case OP_GT:
@@ -923,6 +943,10 @@ static Value eval_binary_op(ASTNode* node) {
                 result = make_bool(left.int_val > right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val > right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val > right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val > (double)right.int_val);
             }
             break;
         case OP_GTE:
@@ -930,6 +954,10 @@ static Value eval_binary_op(ASTNode* node) {
                 result = make_bool(left.int_val >= right.int_val);
             } else if (left.type == VAL_FLOAT && right.type == VAL_FLOAT) {
                 result = make_bool(left.float_val >= right.float_val);
+            } else if (left.type == VAL_INT && right.type == VAL_FLOAT) {
+                result = make_bool((double)left.int_val >= right.float_val);
+            } else if (left.type == VAL_FLOAT && right.type == VAL_INT) {
+                result = make_bool(left.float_val >= (double)right.int_val);
             }
             break;
         case OP_AND:
@@ -1257,6 +1285,16 @@ static ExecResult exec_statement(ASTNode* node) {
     }
 
     switch (node->type) {
+        case AST_FUNCTION_DECL:
+            /* Nested `blast` inside another function body: register it in the
+             * global env instead of letting it fall to `default:` where the
+             * VAL_FUNCTION value was evaluated and discarded. Local scoping
+             * (shadowing an outer name) is future work with closures; this
+             * restores the documented semantics that a declared function is
+             * callable for the rest of the program. */
+            exec_function(node);
+            return EXEC_OK;
+
         case AST_STRUCT_DECL:
             register_struct(node->struct_decl.name, node);
             return EXEC_OK;
