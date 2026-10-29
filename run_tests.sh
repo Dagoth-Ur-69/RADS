@@ -37,6 +37,7 @@ test_files=(
     "test_template_literals.rads"
     "test_promise.rads"
     "test_numeric_mixed.rads"
+    "test_sci_notation.rads"
 )
 
 for test_file in "${test_files[@]}"; do

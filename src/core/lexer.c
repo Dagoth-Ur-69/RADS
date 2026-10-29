@@ -267,21 +267,59 @@ static Token identifier(Lexer* lexer) {
     return make_token(lexer, identifier_type(lexer));
 }
 
+/* number
+ * Why: Lexes integer, decimal, and scientific-notation literals. Scientific
+ *      notation (1e2, 2.5E-3, 7E+0) is Python/TS parity: without it, "1e2"
+ *      lexed as INTEGER(1) followed by IDENTIFIER(e2) and blew up in the
+ *      parser with a confusing "Expected ';'" diagnostic.
+ * How to upgrade: hex literals (0x1F) want a branch before digit scanning;
+ *      separators like 1_000_000 would scan trailing underscores here. Keep
+ *      the rollback law: any half-scanned exponent MUST rewind so the next
+ *      token starts clean (Python errors on "1e" — we rewind to "1").
+ */
 static Token number(Lexer* lexer) {
     while (isdigit(peek(lexer))) {
         advance(lexer);
     }
     
-    // Look for decimal point
+    // Look for decimal point (only when digits follow, so "1..5" range math
+    // and member-ish "arr.length" stays two tokens)
+    bool is_float = false;
     if (peek(lexer) == '.' && isdigit(peek_next(lexer))) {
+        is_float = true;
         advance(lexer); // consume '.'
         while (isdigit(peek(lexer))) {
             advance(lexer);
         }
-        return make_token(lexer, TOKEN_FLOAT);
     }
     
-    return make_token(lexer, TOKEN_INTEGER);
+    // Scientific notation: e/E with MANDATORY sign-or-digit, else it's not
+    // an exponent (rewind so "1e" -> INTEGER 1 + IDENTIFIER e, like Python
+    // tokenizes "1e" as two tokens and then rejects the program).
+    if (peek(lexer) == 'e' || peek(lexer) == 'E') {
+        const char* exp_start = lexer->current;   // rollback anchor */
+        size_t col_anchor = lexer->column;
+        char next = peek_next(lexer);
+        if (isdigit((unsigned char)next) || next == '+' || next == '-') {
+            advance(lexer); // consume e/E
+            if (peek(lexer) == '+' || peek(lexer) == '-') {
+                advance(lexer); // consume exponent sign
+            }
+            if (isdigit(peek(lexer))) {
+                advance(lexer);
+                while (isdigit(peek(lexer))) {
+                    advance(lexer);
+                }
+                is_float = true;
+            } else {
+                // "1e+" / "1e-" with no digits: not an exponent. Roll back.
+                lexer->current = exp_start;
+                lexer->column = (int)col_anchor;
+            }
+        }
+    }
+    
+    return make_token(lexer, is_float ? TOKEN_FLOAT : TOKEN_INTEGER);
 }
 
 static Token string(Lexer* lexer) {

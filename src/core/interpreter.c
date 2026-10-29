@@ -7,9 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h> /* fmod for float modulo in binary ops */
+#include <ctype.h>  /* isdigit for float-format normalization */
 #include <signal.h>
 
 static Value eval_expression(ASTNode* node);
+/* forward decl: value_print (line ~230) renders floats before the full
+ * definition below (line ~734) — keeps -Wimplicit-decl off our back */
+static const char* format_float_shortest(double v, char* buf, size_t buflen);
 static ExecResult exec_statement(ASTNode* node);
 static void exec_function(ASTNode* node);
 static bool is_truthy(Value v);
@@ -223,9 +227,13 @@ void value_print(Value* value) {
         case VAL_INT:
             printf("%lld", value->int_val);
             break;
-        case VAL_FLOAT:
-            printf("%f", value->float_val);
+        case VAL_FLOAT: {
+            /* Python parity: shortest round-trip, ".0" on integral floats
+             * ("%f" padded 2.5 to "2.500000" — fixed in nightshift 20261029) */
+            char fbuf[64];
+            printf("%s", format_float_shortest(value->float_val, fbuf, sizeof(fbuf)));
             break;
+        }
         case VAL_STRING:
             printf("%s", value->string_val);
             break;
@@ -718,6 +726,56 @@ static Value eval_unary_op(ASTNode* node) {
  * 256-byte stack buffers in OP_ADD that silently clipped long values and
  * could overrun on array joins — one dynamic home for the conversion now.
  * Contract: caller owns the returned pointer; never NULL ("" on OOM). */
+/* format_float_shortest — Python/TS parity float rendering.
+ * Why: %g (6 sig digits) display-rounded 1000001.0 to "1e+06" and %f padded
+ *      "2.5" to "2.500000". Python/JS print the SHORTEST string that
+ *      round-trips to the same double, with ".0" on integral floats and
+ *      scientific notation only in Python's exponent window (|x|>=1e16 or
+ *      <1e-4). One home so value_print, concat, and templates never drift.
+ * How to upgrade: if locale-aware decimal commas ever matter, swap snprintf
+ *      for the C locale equivalents; if float128 arrives, widen the buffer.
+ */
+static const char* format_float_shortest(double v, char* buf, size_t buflen) {
+    if (v != v) { snprintf(buf, buflen, "nan"); return buf; }
+    if (v == INFINITY) { snprintf(buf, buflen, "inf"); return buf; }
+    if (v == -INFINITY) { snprintf(buf, buflen, "-inf"); return buf; }
+    if (v == 0.0) { snprintf(buf, buflen, "%s", signbit(v) ? "-0.0" : "0.0"); return buf; }
+
+    int dec_exp = (int)floor(log10(fabs(v)));  /* floor(log10|x|), v!=0 here */
+    bool sci = (dec_exp >= 16 || dec_exp < -4);  /* CPython repr window */
+
+    if (sci) {
+        /* %.*e is ALWAYS scientific with signed 2-digit-min exponent, exactly
+         * CPython's style; increase digits-after-point until it round-trips */
+        for (int p = 0; p <= 16; p++) {
+            snprintf(buf, buflen, "%.*e", p, v);
+            char* e = strchr(buf, 'e');
+            char* end = e;
+            while (end > buf && end[-1] == '0') end--;  /* mantissa zeros */
+            if (end > buf && end[-1] == '.') end--;     /* trailing dot */
+            if (end < e) memmove(end, e, strlen(e) + 1);
+            if (strtod(buf, NULL) == v) return buf;
+        }
+        snprintf(buf, buflen, "%.16e", v);  /* unreachable safety net */
+        return buf;
+    }
+
+    /* fixed window: %.*g flips to sci for small P — skip wrong-form tries */
+    int first_p = dec_exp + 1;
+    if (first_p < 1) first_p = 1;
+    for (int P = first_p; P <= 17; P++) {
+        snprintf(buf, buflen, "%.*g", P, v);
+        if (strchr(buf, 'e')) continue;         /* wrong form for this window */
+        if (strtod(buf, NULL) == v) break;
+    }
+    if (!strchr(buf, '.')) {
+        /* Python prints 100.0, not 100 — integral floats keep ".0" */
+        size_t len = strlen(buf);
+        if (len + 3 <= buflen) { buf[len] = '.'; buf[len+1] = '0'; buf[len+2] = '\0'; }
+    }
+    return buf;
+}
+
 static char* value_to_owned_string(Value v) {
     switch (v.type) {
         case VAL_STRING:
@@ -729,10 +787,9 @@ static char* value_to_owned_string(Value v) {
             return out;
         }
         case VAL_FLOAT: {
-            int needed = snprintf(NULL, 0, "%g", v.float_val);
-            char* out = malloc((size_t)needed + 1);
-            if (out) snprintf(out, (size_t)needed + 1, "%g", v.float_val);
-            return out;
+            char fbuf[64];
+            format_float_shortest(v.float_val, fbuf, sizeof(fbuf));
+            return strdup(fbuf);
         }
         case VAL_BOOL:
             return strdup(v.bool_val ? "true" : "false");
@@ -1692,7 +1749,12 @@ static void report_uncaught_throw(void) {
     switch (thrown_value.type) {
         case VAL_STRING: fprintf(stderr, " error: %s", thrown_value.string_val); break;
         case VAL_INT:    fprintf(stderr, " error: %lld", thrown_value.int_val); break;
-        case VAL_FLOAT:  fprintf(stderr, " error: %f", thrown_value.float_val); break;
+        case VAL_FLOAT: {
+            /* shortest round-trip like echo/concat (was %f padding) */
+            char fbuf[64];
+            fprintf(stderr, " error: %s", format_float_shortest(thrown_value.float_val, fbuf, sizeof(fbuf)));
+            break;
+        }
         case VAL_BOOL:   fprintf(stderr, " error: %s", thrown_value.bool_val ? "true" : "false"); break;
         default:         fprintf(stderr, " error: <value>"); break;
     }
