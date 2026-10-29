@@ -16,6 +16,27 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 **clean-build green** (trio 11+8+17 PASS, runner 9/9, exit 0). Merge that branch to unblock main.
 
 ## Night Log
+
+ - **2026-10-29**: (1) sync: fetch clean, PRs #19-#29 all still open, none merged, base unchanged; cut
+   nightshift/20261029-sci-notation from build-truth head faa4627. (2) 8bd87aa feat(core): **scientific-notation
+   literals + Python-parity float display** (backlog 7 CLOSED). 1e2/2.5E-3/2E+3/1.5e-3 previously lexed as
+   INTEGER+IDENTIFIER -> "Expected ';'" parse error. number() now scans e/E + optional sign + MANDATORY digits,
+   with rollback: bare "1e"/"1e+" rewinds so the e-token stays a clean identifier (same two-token split Python
+   makes before rejecting). Exponent forces FLOAT (7e0 is float, typeof-pinned). Collision check: grepped every
+   test+example for [0-9]e[0-9] OUTSIDE strings — zero hits; number() only fires when a digit starts the token,
+   so UUID/CSS-hex strings are structurally immune. (3) BUG the feature exposed, fixed same unit: float DISPLAY
+   was lying. echo used %f (2.5 -> "2.500000"), concat/templates used %g 6-sig-digit (1e6+1 printed "1e+06" —
+   the +1 display-ROUNDED AWAY; value right, screen wrong). One shared format_float_shortest() now feeds all
+   three render sites (value_print, value_to_owned_string, uncaught-throw stderr): shortest ROUND-TRIP string,
+   ".0" on integral floats, sci only in CPython's repr window (|x|>=1e16 or <1e-4), -0.0, subnormal 5e-324,
+   DBL_MAX exact 1.7976931348623157e+308. All pins from real CPython 3.14 runs (0.30000000000000004, 1e-05,
+   1000000000000000.0). Two formatter drafts died honestly: v1 emitted C-style exponents (1.5e300 vs Python's
+   1.5e+300, 5e-7 vs 5e-07) — v2 uses %.*e directly in the sci window (C's signed 2-digit exponent IS Python's
+   style) and %.*g with skip-wrong-form in the fixed window. (4) tests/test_sci_notation.rads 28 assertions
+   wired as suite 20; runner 20/20. Verified: clean build exit 0 (0 warnings from touched files), 20/20 suites
+   0 FAIL twice, ASan+UBSan+LSan 28/28 0 findings 0 leaks on new suite (numeric_mixed/itertools/promise/
+   decimal/fractions also clean; template/structs still show the KNOWN pre-existing AST leak, backlog 3b,
+   identical on base), malformed battery 1e/1e+/5.5e-/0x1F all clean rejections. PR #30.
  
  - **2026-10-28**: (1) sync: fetch clean, PRs #19-#28 all still open, none merged, base unchanged; cut
    nightshift/20261028-build-truth from promise-allsettled head 74b7ee9. (2) 5d01a60 fix(core): **the honest-runner night** — taught run_tests.sh to grep its own output for FAIL lines (exit-code gate had been lying by omission for months), and it IMMEDIATELY caught 3 suites that have been failing silently on main: v0_0_7_comprehensive (string advanced + math extended), test_debugger (watch expressions), test_typecheck (optional types + generics). Root defects, all pre-existing: (a) eval_binary_op had NO mixed int/float arms for OP_ADD and all six comparison ops — 1+1.5 was null, math.clamp(50,0,100)==50 was false; (b) exec_statement had no AST_FUNCTION_DECL case, so a blast declared INSIDE another function fell to default:, got evaluated, and was DISCARDED — nested helper functions never registered (root cause of debugger+typecheck suite failures); (c) native_str_length existed since forever but was never registered — str.len/string.length returned null. All fixed; nested decls register globally (true local scoping waits for closures — deliberate, logged). tests/test_numeric_mixed.rads 17 assertions (CPython-pinned) wired as suite 19. Makefile: -MMD -MP autodeps (backlog 3d CLOSED — touch lexer.h now rebuilds 4 true dependents, not stale-object segfaults); runner: missing-file=fail, off-by-one Total fixed, stale test_stream.rads entry purged. Negative-tested: runner exits 1 on a planted FAIL-line suite. (3) 1f7deab fix(core): **parser infinite error loop** — a malformed input (stray '}' at statement position, e.g. anything rads-mask's buggy else-dedent emits) looped the SAME 'Expected expression' error FOREVER: 12-line file -> 158MB of output, process hung. Three cooperating defects: parse_block had no forward-progress guard (NULL stmt that consumed nothing re-parsed the same token), parse_primary never consumed the offending token, parse_call deref'd the cascading NULL (segfault hiding behind the loop). 18-input malformed battery all terminate now; valid programs unaffected (19/19). Same commit: rstar registry-search snprintf comma bug (format string terminated mid-JSON — the -d body NEVER reached curl; verified via PATH-shimmed curl capture: body now arrives), rads-mask sprintf overflow sweep (13 unbounded appends -> bounded append_formatted, replace_in_line growth bounded, newline-strip so ';' lands on the right line). (4) DISCOVERED, backlog: rads-mask emits DOUBLE closing braces for if/else + for (dedent closes AND the rule closes — its output has never been valid RADS); RADS has NO scientific notation literals (1e2 is a parse error). Verified: clean build exit 0 (0 warnings from touched files), 19/19 suites 0 FAIL twice, ASan+LSan 0 findings on new code paths (numeric_mixed, malformed-input battery), rstar curl-shim end-to-end. PR #29.
@@ -117,6 +138,7 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 | 24 | fractions module, Python-parity exact rationals | OPEN — head Dagoth-Ur-69:nightshift/20261022-fractions | awaiting master review; fractions done, lazy itertools next |
 | 27 | template literals + scoped call frames (recursion fix) | OPEN — head Dagoth-Ur-69:nightshift/20261026-template-literals | awaiting master review; fib(10) was -80 on main, now 55 | 
 | 29 | honest test runner + mixed numeric ops + nested blast + parser loop fix | OPEN — head Dagoth-Ur-69:nightshift/20261028-build-truth | awaiting master review; 3 suites were silently failing on main |
+| 30 | sci-notation literals + Python-parity float display | OPEN — head Dagoth-Ur-69:nightshift/20261029-sci-notation | awaiting master review; echo/concat display used to lie (%g/%f) |
 | 28 | Promise combinators + exception propagation fix | OPEN — head Dagoth-Ur-69:nightshift/20261027-promise-allsettled | awaiting master review; try/catch across calls + regex.search structs were broken on main |
 | 23 | decimal module, Python-parity arbitrary precision | OPEN — head Dagoth-Ur-69:nightshift/20261021-decimal | awaiting master review; decimal done, fractions next |
 
@@ -133,4 +155,4 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
    `tools/rads-mask/rads-mask` build binary.
 5. ~~v0_0_7_comprehensive.rads not in runner~~ STALE — it was already wired; the REAL issue was the runner ignoring FAIL lines, fixed 2026-10-28 (PR #29).
 6. rads-mask emits DOUBLE closing braces for if/else and for-loops (dedent closes AND the rule closes) — its transpiled output has never been valid RADS. Found 2026-10-28 while verifying the sprintf sweep.
-7. RADS lexer has no scientific-notation float literals (1e2 -> parse error). Python/TS parity gap.
+7. ~~scientific-notation float literals~~ SHIPPED 2026-10-29 (PR #30, with the Python-parity float-display fix it exposed).
