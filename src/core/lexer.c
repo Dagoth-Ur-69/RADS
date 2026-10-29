@@ -297,7 +297,7 @@ static Token number(Lexer* lexer) {
     // an exponent (rewind so "1e" -> INTEGER 1 + IDENTIFIER e, like Python
     // tokenizes "1e" as two tokens and then rejects the program).
     if (peek(lexer) == 'e' || peek(lexer) == 'E') {
-        const char* exp_start = lexer->current;   // rollback anchor */
+        const char* exp_start = lexer->current;   // rollback anchor
         size_t col_anchor = lexer->column;
         char next = peek_next(lexer);
         if (isdigit((unsigned char)next) || next == '+' || next == '-') {
