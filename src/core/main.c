@@ -485,6 +485,7 @@ int run_repl() {
 
     // Clean up environment and event loop on exit
     interpreter_cleanup_environment();
+    stdlib_regex_cache_flush(); /* pattern cache owns heap nothing else frees */
     interpreter_cleanup_event_loop();
     return 0;
 }

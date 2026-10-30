@@ -384,9 +384,15 @@ static ASTNode* parse_call(Parser* parser) {
         if (match(parser, TOKEN_LEFT_BRACE)) { // Struct literal
             if (expr->type != AST_IDENTIFIER) {
                 error(parser, "Expected struct name before '{'");
+                /* Panic path must release the partial AST we own, or every
+                 * malformed call leaks callee+args (LSan-confirmed). */
+                ast_free(expr);
                 return NULL;
             }
             char* struct_name = expr->identifier.name;
+            /* The identifier node is consumed by this literal: steal its name
+             * and free the node shell, otherwise both leak (backlog 3b). */
+            free(expr);
             int line = parser->previous.line;
             int column = parser->previous.column;
 
@@ -410,6 +416,7 @@ static ASTNode* parse_call(Parser* parser) {
             consume(parser, TOKEN_RIGHT_BRACE, "Expected '}' after struct literal");
 
             expr = ast_create_struct_literal(struct_name, fields, line, column);
+            free(struct_name); /* ast_create_struct_literal strdups; release the stolen original */
 
         } else if (match(parser, TOKEN_LEFT_PAREN)) {
             ASTList* args = ast_list_create();
@@ -774,7 +781,9 @@ static ASTNode* parse_destructure_element(Parser* parser) {
         char* name = malloc(parser->previous.length + 1);
         memcpy(name, parser->previous.start, parser->previous.length);
         name[parser->previous.length] = '\0';
-        return ast_create_destructure_rest(name, line, column);
+        ASTNode* rest = ast_create_destructure_rest(name, line, column);
+        free(name); /* creator strdups; this temp used to leak (LSan-found) */
+        return rest;
     }
     
     if (match(parser, TOKEN_COMMA)) {

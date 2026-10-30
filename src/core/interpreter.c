@@ -510,6 +510,44 @@ static ASTNode* find_struct(const char* name) {
     return NULL;
 }
 
+/* --- Interned StructDef table (backlog 3b) -------------------------------
+ * Eval of a struct literal used to malloc a fresh StructDef + strdup the
+ * name for EVERY instance; value_free never released them (clones share
+ * the pointer, so freeing per-instance would double-free). Interning gives
+ * one immortal-per-program StructDef per struct NAME -- same ownership
+ * model the stdlib already uses (datetime_def() et al. are static structs)
+ * -- and interpreter_cleanup_environment() frees the table at teardown.
+ */
+typedef struct InternedStructDef {
+    StructDef def;
+    struct InternedStructDef* next;
+} InternedStructDef;
+
+static InternedStructDef* interned_struct_defs = NULL;
+
+static StructDef* struct_def_intern(const char* name, ASTNode* ast_node) {
+    for (InternedStructDef* it = interned_struct_defs; it; it = it->next) {
+        if (strcmp(it->def.name, name) == 0) return &it->def;
+    }
+    InternedStructDef* entry = malloc(sizeof(InternedStructDef));
+    entry->def.name = strdup(name);
+    entry->def.ast_node = ast_node;
+    entry->next = interned_struct_defs;
+    interned_struct_defs = entry;
+    return &entry->def;
+}
+
+static void interned_struct_defs_free(void) {
+    InternedStructDef* it = interned_struct_defs;
+    while (it) {
+        InternedStructDef* next = it->next;
+        free(it->def.name);
+        free(it);
+        it = next;
+    }
+    interned_struct_defs = NULL;
+}
+
 static void env_free_structs() {
     StructDefBinding* current = struct_definitions;
     while (current) {
@@ -1166,7 +1204,8 @@ static Value eval_expression(ASTNode* node) {
                         FieldValue* current = object_ref->struct_instance->fields;
                         while (current) {
                             if (strcmp(current->name, member_name) == 0) {
-                                value_release(current->value);
+                                value_release(current->value); /* free old contents... */
+                                free(current->value);           /* ...and the box itself (was leaked) */
                                 current->value = malloc(sizeof(Value));
                                 *current->value = value_clone(value);
                                 break;
@@ -1182,7 +1221,8 @@ static Value eval_expression(ASTNode* node) {
                         FieldValue* current = object.struct_instance->fields;
                         while (current) {
                             if (strcmp(current->name, member_name) == 0) {
-                                value_release(current->value);
+                                value_release(current->value); /* free old contents... */
+                                free(current->value);           /* ...and the box itself (was leaked) */
                                 current->value = malloc(sizeof(Value));
                                 *current->value = value_clone(value);
                                 break;
@@ -1207,9 +1247,7 @@ static Value eval_expression(ASTNode* node) {
             }
 
             StructInstance* instance = malloc(sizeof(StructInstance));
-            instance->definition = malloc(sizeof(StructDef));
-            instance->definition->name = strdup(node->struct_literal.name);
-            instance->definition->ast_node = def_node;
+            instance->definition = struct_def_intern(node->struct_literal.name, def_node);
             instance->fields = NULL;
 
             for (size_t i = 0; i < node->struct_literal.fields->count; i++) {
@@ -1828,7 +1866,7 @@ int interpret(ASTNode* program) {
         value_free(&main_val);
         if (has_thrown_value) {
             report_uncaught_throw();
-            env_free();
+            interpreter_cleanup_environment();
             interpreter_cleanup_event_loop();
             return 1; /* Python/Node parity: uncaught exception -> nonzero exit */
         }
@@ -1844,7 +1882,10 @@ int interpret(ASTNode* program) {
     }
 
 
-    env_free();
+    /* Full teardown on the file path too: env + struct/enum registries +
+     * interned StructDefs. Previously only env_free() ran here, so every
+     * file run leaked the struct/enum binding tables (LSan-visible). */
+    interpreter_cleanup_environment();
     interpreter_cleanup_event_loop();
     return 0;
 }
@@ -1869,6 +1910,7 @@ int interpret_repl_statement(ASTNode* stmt) {
 // Clean up the global environment (call when exiting REPL)
 void interpreter_cleanup_environment(void) {
     env_free();
+    interned_struct_defs_free();
     env_free_structs();
     env_free_enums();
 }

@@ -99,13 +99,17 @@ static bool translate_pattern(const char* pat, char** ere_out, char*** names_out
             if (p) {
                 size_t j = ni;
                 if (j >= plen || !(isalpha((unsigned char)pat[j]) || pat[j] == '_')) {
-                    free(ere); free(names); free(idx);
+                    free(ere);
+                for (int k = 0; k < name_count; k++) free(names[k]);
+                free(names); free(idx);
                     *err = "named group needs a name starting with a letter or underscore";
                     return false;
                 }
                 while (j < plen && is_name_char(pat[j])) j++;
                 if (j >= plen || pat[j] != '>') {
-                    free(ere); free(names); free(idx);
+                    free(ere);
+                for (int k = 0; k < name_count; k++) free(names[k]);
+                free(names); free(idx);
                     *err = "named group is missing its closing '>'";
                     return false;
                 }
@@ -114,16 +118,20 @@ static bool translate_pattern(const char* pat, char** ere_out, char*** names_out
                 for (int k = 0; k < name_count; k++) {
                     size_t nl = j - ni;
                     if (strlen(names[k]) == nl && strncmp(names[k], pat + ni, nl) == 0) {
-                        free(ere); free(names); free(idx);
+                        free(ere);
+                for (int k = 0; k < name_count; k++) free(names[k]);
+                free(names); free(idx);
                         *err = "duplicate group name in pattern";
                         return false;
                     }
                 }
                 char** nn = realloc(names, (size_t)(name_count + 1) * sizeof(char*));
-                if (!nn) { free(ere); free(idx); free(names); *err = "out of memory"; return false; }
+                if (!nn) { free(ere); free(idx);
+                for (int k = 0; k < name_count; k++) free(names[k]);
+                free(names); *err = "out of memory"; return false; }
                 names = nn;
                 int* nx = realloc(idx, (size_t)(name_count + 1) * sizeof(int));
-                if (!nx) { free(ere); free(names); *err = "out of memory"; return false; }
+                if (!nx) { free(ere); for (int k = 0; k < name_count; k++) free(names[k]); free(names); *err = "out of memory"; return false; }
                 idx = nx;
                 size_t nl = j - ni;
                 names[name_count] = malloc(nl + 1);
@@ -142,7 +150,9 @@ static bool translate_pattern(const char* pat, char** ere_out, char*** names_out
                 continue;
             }
             if (strncmp(pat + i, "(?=", 3) == 0 || strncmp(pat + i, "(?!", 3) == 0) {
-                free(ere); free(names); free(idx);
+                free(ere);
+                for (int k = 0; k < name_count; k++) free(names[k]);
+                free(names); free(idx);
                 *err = "lookahead assertions are not supported by the regex engine";
                 return false;
             }
@@ -153,7 +163,9 @@ static bool translate_pattern(const char* pat, char** ere_out, char*** names_out
         ere[o++] = c;
     }
     ere[o] = '\0';
-    if (in_class) { free(ere); free(names); free(idx); *err = "unterminated character class"; return false; }
+    if (in_class) { free(ere);
+                for (int k = 0; k < name_count; k++) free(names[k]);
+                free(names); free(idx); *err = "unterminated character class"; return false; }
 
     *ere_out = ere;
     *names_out = names;
@@ -317,6 +329,7 @@ Value stdlib_regex_findall(Interpreter* interp, int argc, Value* args) {
         item.type = VAL_STRING;
         item.string_val = match_str;
         array_push(result_arr, item);
+        free(match_str); /* array_push clones; release the fresh original */
 
         // Move cursor past this match
         if (end == 0) {
@@ -656,6 +669,7 @@ Value stdlib_regex_split(Interpreter* interp, int argc, Value* args) {
                 item.type = VAL_STRING;
                 item.string_val = part;
                 array_push(result_arr, item);
+                free(part); /* array_push clones; release the fresh original */
             }
             break;
         }
@@ -677,6 +691,7 @@ Value stdlib_regex_split(Interpreter* interp, int argc, Value* args) {
         item.type = VAL_STRING;
         item.string_val = part;
         array_push(result_arr, item);
+        free(part); /* array_push clones; release the fresh original */
 
         // Move past match
         last_end = cursor + end;
@@ -740,12 +755,14 @@ Value stdlib_regex_groups(Interpreter* interp, int argc, Value* args) {
             item.type = VAL_STRING;
             item.string_val = group_str;
             array_push(result_arr, item);
+            free(group_str); /* array_push clones; release the fresh original */
         } else {
             // No match for this group, add empty string
             Value item;
             item.type = VAL_STRING;
             item.string_val = strdup("");
             array_push(result_arr, item);
+            free(item.string_val); /* array_push clones; release the fresh original */
         }
     }
 
@@ -853,13 +870,36 @@ Value stdlib_regex_group_names(Interpreter* interp, int argc, Value* args) {
 
     Array* result_arr = array_create((size_t)(entry->name_count > 0 ? entry->name_count : 1));
     for (int i = 0; i < entry->name_count; i++) {
-        array_push(result_arr, make_string(entry->names[i]));
+        Value name_val = make_string(entry->names[i]);
+        array_push(result_arr, name_val);
+        free(name_val.string_val); /* push cloned it; release the original */
     }
 
     Value ret;
     ret.type = VAL_ARRAY;
     ret.array_val = result_arr;
     return ret;
+}
+
+/* Flush the compiled-pattern cache. Why: every cached pattern owns heap
+ * (pattern/ere/names/name_group + the regcomp state itself) that nothing
+ * ever released -- the static array died at exit holding all of it.
+ * Called from main at shutdown so LSan sees a clean process. Extend:
+ * other stdlib caches (json, glob...) should grow the same flush hook. */
+void stdlib_regex_cache_flush(void) {
+    for (int i = 0; i < cache_count && i < MAX_REGEX_CACHE; i++) {
+        if (!regex_cache[i].valid) continue;
+        regfree(&regex_cache[i].compiled);
+        free(regex_cache[i].pattern);
+        free(regex_cache[i].ere);
+        for (int k = 0; k < regex_cache[i].name_count; k++) {
+            free(regex_cache[i].names[k]);
+        }
+        free(regex_cache[i].names);
+        free(regex_cache[i].name_group);
+        regex_cache[i].valid = false;
+    }
+    cache_count = 0;
 }
 
 void stdlib_regex_register(void) {

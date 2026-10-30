@@ -433,7 +433,7 @@ Value native_str_split(struct Interpreter* interp, int argc, Value* args) {
         if (strncmp(p, delim, strlen(delim)) == 0) {
             if (buf_idx > 0) {
                 buffer[buf_idx] = '\0';
-                Value elem; elem.type = VAL_STRING; elem.string_val = strdup(buffer);
+                Value elem; elem.type = VAL_STRING; elem.string_val = buffer; /* push clones */
                 array_push(v.array_val, elem);
                 buf_idx = 0;
             }
@@ -445,7 +445,7 @@ Value native_str_split(struct Interpreter* interp, int argc, Value* args) {
     
     if (buf_idx > 0) {
         buffer[buf_idx] = '\0';
-        Value elem; elem.type = VAL_STRING; elem.string_val = strdup(buffer);
+        Value elem; elem.type = VAL_STRING; elem.string_val = buffer; /* push clones */
         array_push(v.array_val, elem);
     }
     return v;

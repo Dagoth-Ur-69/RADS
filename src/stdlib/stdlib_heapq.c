@@ -209,7 +209,7 @@ static Value top_k(struct Interpreter* interp, int argc, Value* args, int larges
         if (v.type == VAL_STRING) {
             Value s;
             s.type = VAL_STRING;
-            s.string_val = strdup(v.string_val);
+            s.string_val = v.string_val; /* array_push clones it — the pre-strdup leaked */
             array_push(out, s);
         } else {
             array_push(out, v);
@@ -247,7 +247,7 @@ Value stdlib_heapq_merge(struct Interpreter* interp, int argc, Value* args) {
         if (v->type == VAL_STRING) {
             Value s;
             s.type = VAL_STRING;
-            s.string_val = strdup(v->string_val);
+            s.string_val = v->string_val; /* array_push clones it — the pre-strdup leaked */
             array_push(out, s);
         } else {
             array_push(out, *v);
