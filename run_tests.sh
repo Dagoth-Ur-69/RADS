@@ -39,6 +39,8 @@ test_files=(
     "test_numeric_mixed.rads"
     "test_sci_notation.rads"
     "test_memory_truth.rads"
+    "test_v0.0.12.rads"
+    "test_js_syntax.rads"
 )
 
 for test_file in "${test_files[@]}"; do

@@ -698,6 +698,7 @@ Value native_str_interpolate(struct Interpreter* interp, int argc, Value* args) 
 
 void stdlib_string_register(void) {
     register_native("str.len", native_str_length);
+    register_native("str.length", native_str_length); /* JS parity alias (20261031) */
     register_native("string.length", native_str_length);
     register_native("str.trim", native_str_trim);
     register_native("str.substring", native_str_substring);

@@ -600,6 +600,8 @@ static void env_free_enums() {
 }
 
 // Evaluate call expression
+bool interpreter_has_throw(void);  /* pending-throw query (declared in interpreter.h, defined below) */
+
 static Value eval_call(ASTNode* node) {
     // For now, only support calling global native functions or simple function calls
     // Real implementation would need full environment/scope support
@@ -667,6 +669,65 @@ static Value eval_call(ASTNode* node) {
             full_name = malloc(len);
             sprintf(full_name, "%s.%s", obj_name, member);
             name = full_name;
+        } else if (obj->type == AST_CALL_EXPR && member) {
+            /* Chained call on a call result (nightshift 20261031):
+             * `test.expect(v).toBe(x)` — the receiver is itself a call.
+             * When that inner call's callee is module-shaped
+             * (`IDENT . member (...)`), the chain dispatches the SAME
+             * module's native with the inner RESULT as first argument:
+             * test.expect(3).toBe(4) -> native "test.toBe"(3, 4).
+             * This is the contract the test framework was designed around;
+             * before this branch existed the whole assertion chain silently
+             * returned null — expect(1+2).toBe(4) "passed" (LSan probes). */
+            ASTNode* inner_callee = obj->call_expr.callee;
+            if (inner_callee->type == AST_MEMBER_EXPR &&
+                inner_callee->member_expr.object->type == AST_IDENTIFIER) {
+                const char* module = inner_callee->member_expr.object->identifier.name;
+                char chained[128];
+                snprintf(chained, sizeof(chained), "%s.%s", module, member);
+                NativeFn native = find_native(chained);
+                if (native) {
+                    Value inner = eval_call(obj);   /* e.g. expect() result */
+                    if (interpreter_has_throw()) { value_free(&inner); return make_null(); }
+                    int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
+                    Value* args = malloc(sizeof(Value) * (argc + 1));
+                    args[0] = inner;                /* receiver first */
+                    for (int i = 0; i < argc; i++) {
+                        args[i + 1] = eval_expression(node->call_expr.arguments->nodes[i]);
+                    }
+                    Value result = native(global_interpreter, argc + 1, args);
+                    for (int i = 0; i < argc + 1; i++) value_free(&args[i]);
+                    free(args);
+                    return result;
+                }
+            }
+            /* String-valued receiver: allow str.* methods chained on any
+             * string-producing expression (`json.stringify(x).len()`). */
+            Value inner = eval_call(obj);
+            if (interpreter_has_throw()) { value_free(&inner); return make_null(); }
+            if (inner.type == VAL_STRING) {
+                char native_name[128];
+                snprintf(native_name, sizeof(native_name), "str.%s", member);
+                NativeFn native = find_native(native_name);
+                if (native) {
+                    int argc = node->call_expr.arguments ? (int)node->call_expr.arguments->count : 0;
+                    Value* args = malloc(sizeof(Value) * (argc + 1));
+                    args[0] = value_retain(inner);
+                    for (int i = 0; i < argc; i++) {
+                        args[i + 1] = eval_expression(node->call_expr.arguments->nodes[i]);
+                    }
+                    Value result = native(global_interpreter, argc + 1, args);
+                    for (int i = 0; i < argc + 1; i++) value_free(&args[i]);
+                    free(args);
+                    value_free(&inner);
+                    return result;
+                }
+            }
+            value_free(&inner);
+            /* Nothing dispatched: this is a real programming error now, not
+             * a silent null (honest-failure law). */
+            fprintf(stderr, "Error: cannot call method '%s' on call result\n", member);
+            return make_null();
         }
     } else if (node->call_expr.callee->type == AST_IDENTIFIER) {
         name = node->call_expr.callee->identifier.name;
@@ -1721,6 +1782,10 @@ static ExecResult exec_statement(ASTNode* node) {
 
 // Execute function
 static void exec_function(ASTNode* node) {
+    /* Anonymous lambdas (fn(){}/blast(){}) have name==NULL: there is no
+     * global name to bind — they live only as first-class values inside
+     * expressions. Guard env_set against NULL (nightshift 20261031). */
+    if (node->function_decl.name == NULL) return;
     // Store in environment for lookup (including as first-class values)
     Value v;
     v.type = VAL_FUNCTION;
@@ -1872,11 +1937,38 @@ int interpret(ASTNode* program) {
         }
     } else {
         // Fallback: search declarations (legacy)
+        bool found_main = false;
         for (size_t i = 0; i < program->program.declarations->count; i++) {
             ASTNode* decl = program->program.declarations->nodes[i];
-            if (decl->type == AST_FUNCTION_DECL && strcmp(decl->function_decl.name, "main") == 0) {
+            if (decl->type == AST_FUNCTION_DECL && decl->function_decl.name != NULL &&
+                strcmp(decl->function_decl.name, "main") == 0) {
                 exec_statement(decl->function_decl.body);
+                found_main = true;
                 break;
+            }
+        }
+
+        /* Script mode (nightshift 20261031, JS parity): a file with NO
+         * main() executes its top-level statements in order — test_v0.0.12
+         * and test_http are plain scripts. Structs/enums/functions are
+         * already registered by Pass 1; every OTHER declaration runs now.
+         * A pending throw unwinds like an uncaught exception (same law as
+         * the main() path above). */
+        if (!found_main) {
+            for (size_t i = 0; i < program->program.declarations->count; i++) {
+                ASTNode* decl = program->program.declarations->nodes[i];
+                if (decl->type == AST_FUNCTION_DECL || decl->type == AST_STRUCT_DECL ||
+                    decl->type == AST_ENUM_DECL || decl->type == AST_IMPORT_STMT) {
+                    continue;   /* already handled by Pass 0/1 */
+                }
+                exec_statement(decl);
+                if (has_thrown_value) break;
+            }
+            if (has_thrown_value) {
+                report_uncaught_throw();
+                interpreter_cleanup_environment();
+                interpreter_cleanup_event_loop();
+                return 1;
             }
         }
     }

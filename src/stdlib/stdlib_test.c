@@ -239,7 +239,7 @@ Value stdlib_test_toBe(Interpreter* interp, int argc, Value* args) {
         char* expected_str = value_to_string(&expected);
         char message[256];
         snprintf(message, sizeof(message), "Expected %s, got %s", expected_str, actual_str);
-        set_test_result(false, strdup(message));
+        set_test_result(false, message);   /* set_test_result strdups — the stack buffer is fine */
         free(actual_str);
         free(expected_str);
     } else {
@@ -493,7 +493,9 @@ Value stdlib_test_run(Interpreter* interp, int argc, Value* args) {
                 suite->passed++;
                 total_passed++;
             } else {
-                printf("  %s✗%s %s\n", COLOR_RED, COLOR_RESET, test->name);
+                /* Runner contract: run_tests.sh greps stdout for 'FAIL' —
+                 * a silent ✗ line was invisible to the honest gate. */
+                printf("  %s✗ FAIL: %s%s\n", COLOR_RED, test->name, COLOR_RESET);
                 if (current_test_message) {
                     printf("    %s└─ %s%s\n", COLOR_DIM, current_test_message, COLOR_RESET);
                 }
