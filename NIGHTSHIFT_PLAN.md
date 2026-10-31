@@ -17,6 +17,44 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 
 ## Night Log
 
+ - **2026-10-31**: (1) sync: fetch clean, PRs #19-#31 all still open, none merged; cut
+   nightshift/20261031-js-syntax-parity from struct-leak head d68c72b. (2) f2faa02
+   feat(core): **BACKLOG 9 CLOSED — JS syntax parity night**. test_v0.0.12 (and test_http)
+   were written in JS-style syntax RADS could not parse; v0.0.12 had NEVER compiled.
+   Shipped: (a) fn(params){} lambdas — contextual via lexer-snapshot lookahead (Lexer is a
+   self-contained struct: pointers + fixed tpl stack, plain copy = valid snapshot; fn stays
+   a plain identifier — fn(5) is still a call, bare fn still a variable); lowers to the same
+   nameless AST_FUNCTION_DECL blast() lambdas use, runtime path already worked (probe:
+   blast-lambda-as-arg returned 42 on base). (b) let — contextual let NAME same-line
+   lookahead -> AST_VARIABLE_DECL. (c) ASI — consume_semi(): ';', newline, '}' or EOF
+   terminates; return uses the JS restriction production (value must start on the return's
+   line); for-headers stay strict. (d) SCRIPT MODE — files without main() now execute
+   top-level statements in order (before tonight, top-level test.describe()/test.run() ran
+   ZERO statements — a whole test framework existed but nothing could invoke it from a
+   script). (3) THE FRAMEWORK WAS LYING: test.expect(1+2).toBe(4) printed a green check.
+   Chained calls on call RESULTS never dispatched (callee's object was a call expr, not an
+   identifier, so no native name could be built) — every assertion in every framework suite
+   silently passed. Fix: chained dispatch — inner callee module-shape (IDENT.member(...)) ->
+   dispatch "module.matcher" with the inner result as FIRST arg; string results also get
+   str.* method dispatch. Framework failures now print grep-able "FAIL:" lines (the runner
+   greps for exactly that). toBe dropped a double-strdup leak. (4) json.parse LEAKED
+   ~256B/object + originals (jp_parse_object/jp_parse_array push-then-orphan — same
+   array_push-clone class as PR #31); 1860B repro on base -> 0 after. (5) NULL-name guards:
+   anonymous top-level lambdas hit strcmp(NULL,"main") in the legacy main-search and
+   env_set(NULL,...) in exec_function. (6) test_v0.0.12: escaped-JSON strings rewritten as
+   template literals (RADS strings are RAW — backticks hold JSON verbatim, zero escaping);
+   the \n expectation is a real newline in a template. 50/50 PASSED, wired as suite 22.
+   (7) tests/test_js_syntax.rads — 15 pins (fn-as-identifier, fn(...)-as-call non-hijack,
+   ASI, let, script mode, chained str methods), negative-tested with a planted failure;
+   wired as suite 23. (8) My own corpse bugs caught by probes: first suite draft had a
+   self-defeating collision test (blast fn + let fn rebind order) and an expected-count
+   that could lie; three regex/patch misfires on the suite file (one ate "hello" and
+   doubled a paren) — all caught by parse errors and the planted-failure gate. Verified:
+   make clean && make -j4 exit 0; 23/23 suites PASSED 0 FAIL lines grepped twice; ASan+
+   UBSan+LSan clean on both new suites AND a repo-wide tests/*.rads sweep — 0 LEAKY SUITES
+   (8 on base two nights ago, 1 last night); bare top-level lambda safe. test_http now
+   PARSES end-to-end (blocks only on the bare-{ object-literal gap — backlog 11). PR #32:
+   https://github.com/zarigata/RADS/pull/32
  - **2026-10-30**: (1) sync: fetch clean, PRs #19-#30 all still open, none merged; cut nightshift/20261030-struct-ast-leak from sci-notation head 38874ce. (2) 07220e7 fix(core,stdlib): **BACKLOG 3b CLOSED — the struct-literal leak night, and the leak CLASS it was hiding**. Four cooperating defects, every one LSan-verified on base first: (a) parser struct-literal branch borrowed expr->identifier.name then DROPPED the node without ast_free — identifier node + name leaked per literal; (b) interpreter mallocd a fresh StructDef + strdup name per INSTANCE, value_free never released (clones share the pointer; per-instance free = double-free) — now INTERNED per struct name, same ownership model as stdlib static defs, freed at teardown; (c) member-assign (p.x=v) released contents but leaked the Value BOX; (d) interpret() exit paths only ran env_free() — struct/enum registries leaked EVERY file run; full teardown now on success + uncaught-throw paths. (3) THE CLASS: array_push DEEP-COPIES (value_clone) every push, so any native that strdups a string then pushes it leaks the original. 14 stdlib sites swept (queue x4, string x2, string_advanced, csv, cli x3, env, copy, heapq x2) + regex findall/split/groups/group_names + 7 translate_pattern ERROR paths (freed the names array, not the stored name strings) + stdlib_regex_cache_flush() (pattern cache died at exit holding its heap) + fs.readdir (6KB PER CALL) + csv.parse (256B) + copy.deepcopy per-item + parser ...rest temp + struct-literal panic path (leaked callee+args on Expected-struct-name errors). (4) DISCOVERED: tests/test_v0.0.11 and test_v0.0.12 have NEVER COMPILED — they use fn() {} anonymous-function syntax the language DOES NOT HAVE (fn lexes as identifier -> fn() parses as call -> { becomes struct literal -> error). Their leaks were parse-error leaks. fn-as-lambda is a real parity gap: BACKLOG 9. (5) tests/test_memory_truth.rads — 16 behavior pins over every fixed construct, wired as suite 21; runs clean under ASan+UBSan+LSan. (6) My own corpse-quality bugs en route: deepcopy first draft pushed *v (infinite recursion) — caught before build; three stray-quote artifacts from printf patching — all caught by compiler; heapq/string_advanced pushes had stale comments. Verified: clean build exit 0 plain+sanitize, runner 21/21 PASSED 0 FAIL lines (grepped) twice on BOTH builds, probe numbers base->branch: struct x2 152B/8alloc -> 0/0, test_structs 102B/5 -> 0/0, repo-wide tests LSan sweep 8 suites leaky -> 1 (pre-existing async_utils callback leaks, BACKLOG 10). PR #31.
 
 
@@ -160,5 +198,6 @@ Branch `nightshift/20261013-stdlib-float-parity` carries the completed port to t
 5. ~~v0_0_7_comprehensive.rads not in runner~~ STALE — it was already wired; the REAL issue was the runner ignoring FAIL lines, fixed 2026-10-28 (PR #29).
 6. rads-mask emits DOUBLE closing braces for if/else and for-loops (dedent closes AND the rule closes) — its transpiled output has never been valid RADS. Found 2026-10-28 while verifying the sprintf sweep.
 7. ~~scientific-notation float literals~~ SHIPPED 2026-10-29 (PR #30, with the Python-parity float-display fix it exposed).
-9. **fn-lambda syntax parity gap**: tests/test_v0.0.11 + test_v0.0.12 use fn() { } anonymous functions RADS cannot parse (fn = plain identifier; blast() { } is the only anon-fn syntax). Both suites have NEVER compiled and are not in the runner. Either add fn-lambda parsing (JS/TS parity — callbacks everywhere in modern code) or rewrite them in blast() form and wire them in.
+9. ~~fn-lambda syntax parity gap~~ CLOSED 2026-10-31 (PR #32): fn(){} lambdas + let + ASI + script mode shipped; test_v0.0.12 resurrected 50/50 (suite 22), test_js_syntax 15 pins (suite 23). BONUS: the test framework's assertions never actually RAN before (chained calls silently null) — fixed with module-shaped chained dispatch; json.parse leak class swept.
 10. **async_utils callback leaks**: stdlib_async_series/parallel leak ~32B per callback via interpreter_execute_callback value_clone + the result Array (LSan on tests/test_filesystem.rads). Pre-existing, untouched by the 2026-10-30 sweep. Needs an event-loop-owned lifetime audit.
+11. **bare-{ object literals at argument position** (JS parity): `json.stringify({"test": "rads"})` — a `{` after `(` parses as struct literal requiring a NAME and fails (`test_http.rads` line 33 is the live repro; the file parses fully once this lands). Needs primary-expression `{` support (map-literal shape like JS) or a clearer diagnostic suggesting named-struct syntax.
